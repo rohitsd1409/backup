@@ -1,0 +1,349 @@
+uid: 0 euid: 0
+uid: 0 euid: 0
+Configuring Daemon..
+Configuring sigaction struct for SIGCHLD..
+configuring sigaction() for SIGCHLD
+/tmp/backup already exists..
+Dir with requested name: /tmp/backup and mode already exists..
+/tmp/backup created/dir already exists..
+Making sure that no other instance of this daemon is running..
+single_instance_check() called..
+Opening lock-file..
+Configuring Lock..
+Lock Configured..
+Acquiring Lock..
+Lock Acquired..
+Only single Instance Running..
+Daemon-v-001 configured for use..
+Creating Sockets..
+Sockets Created: 4 5..
+Configuring Binding Details..
+Port: 34835
+Port: 35091
+Binding Details Configured..
+Performing Binding..
+Binding Performed Successfully..
+Converting sockets into listening Sockets..
+listening Sockets Created..
+Calling select() on Listening sockets till member 6 of read set..
+select() returned..
+sock_fd_lh is set..
+Connection accepted on descriptor: 6
+New thread created..
+Calling select() on Listening sockets till member 6 of read set..
+
+Struct contents
+
+options enabled: 1
+options type: f
+parameter count: 3
+parameter[0]: 1
+parameter[1]: /home/bhojas/Documents/
+parameter[2]: /home/bhojas/Desktop/
+dest. ip:     127.0.0.1
+hash:         KM6iSBrp1HHnVFmVuTiRs1
+parsing arguements..
+Option selected: sanbackup -f nmin <src> <dest>..
+or
+Option selected: sanbackup -f nmin <src> <dest> <ip>..
+new_backup()..
+Acquired mutex lock on: &backup.mutex
+src: /home/bhojas/Documents/
+dest: /home/bhojas/Desktop/
+backup_op configured..
+Configuring backup_id node..
+search_node() called..
+Serching node: </home/bhojas/Documents/,/home/bhojas/Desktop/,127.0.0.1,0>
+Empty list..No searching performed..
+Forking child to handle requested backup operation..
+Trying to close the Descriptor: 4
+Successfully Closed the Descriptor: 4
+Trying to close the Descriptor: 5
+Successfully Closed the Descriptor: 5
+[4471]Inside Child..
+[4471]backup_op struct..
+[4471]b_op.src: 	/home/bhojas/Documents/
+[4471]b_op.dest: 	/home/bhojas/Desktop/
+[4471]b_op.nmin: 	1
+[4471]b_op.b_ctr: -1
+[4471]b_op.hash:	KM6iSBrp1HHnVFmVuTiRs1
+[4471]b_op.dest_ip:127.0.0.1
+[4471]b_op.last_bt[0]: 
+[4471]b_op.last_bt[1]: 
+[4471]b_op.last_bt[2]: 
+[4471]b_op.last_bt[3]: 
+[4471]b_op.last_bt[4]: 
+[4471]b_op.last_bt[5]: 
+[4471]b_op.last_bt[6]: 
+[4471]b_op.itimer.it_interval.tv_sec: 	60
+[4471]b_op.itimer.it_interval.tv_usec: 	0
+[4471]b_op.itimer.it_value.tv_sec: 	1
+[4471]b_op.itimer.it_value.tv_usec: 	0
+[4471]configuring sigaction struct obj..
+[4471]registering signals with sigaction()..
+[4471]setting interval timer..
+
+[4471]waiting for signal..
+[4471]SIGALRM received..
+[Sender]Creating Socket..
+[Sender]Socket Created: 4..
+[Sender]Configuring Connnection Details..
+[Sender]Connnection Details Configured Successfully..
+[Sender]Trying to Connect with Daemon..
+[Sender]Connection Established with Daemon..
+[Sender]Sending details of backup to remote Daemon..
+[Sender]b_op struct sent successfully to remote Daemon..
+[Sender]Flag received from Remote Daemon: y
+[Sender]Backup dirname received from Remote Daemon: 20160522151349
+[Sender]Generating absolute name of dest. (on remote host) for current backup..
+Arg0: 0
+updated len: 1
+Arg0: /home/bhojas/Desktop/
+updated len: 22
+Arg1: 20160522151349
+updated len: 36
+Arg2: /
+updated len: 37
+[Sender]Generated absolute name of dest. for current backup: /home/bhojas/Desktop/20160522151349/..
+[Sender]Calling send_backup_data() ..
+[4471]Opening directory: /home/bhojas/Documents/
+[4471]Directory /home/bhojas/Documents/ opened successfully..
+[4471]File: test
+[4471]Generating Absolute path of src. file..
+Arg0: 1
+updated len: 2
+Arg0: /home/bhojas/Documents/
+updated len: 25
+Arg1: test
+updated len: 29
+[4471]Absolute path of src. file: /home/bhojas/Documents/test[4471]Generating Absolute path of dest. file..
+Arg0: 1
+updated len: 2
+Arg0: /home/bhojas/Desktop/20160522151349/
+updated len: 38
+Arg1: test
+updated len: 42
+[4471]Absolute path of Dest.file: /home/bhojas/Desktop/20160522151349/test
+[4471]Getting stats of file: /home/bhojas/Documents/test
+[4471]Successfuly retrieved the stats of file: /home/bhojas/Documents/test
+Sending backup file stats to remote Dauid: 0 euid: 0
+Configuring Daemon..
+Configuring sigaction struct for SIGCHLD..
+configuring sigaction() for SIGCHLD
+/tmp/backup already exists..
+Dir with requested name: /tmp/backup and mode already exists..
+/tmp/backup created/dir already exists..
+Making sure that no other instance of this daemon is running..
+single_instance_check() called..
+Opening lock-file..
+Configuring Lock..
+Lock Configured..
+Acquiring Lock..
+Lock Acquired..
+Only single Instance Running..
+Daemon-v-001 configured for use..
+Creating Sockets..
+Sockets Created: 4 5..
+Configuring Binding Details..
+Port: 34835
+Port: 35091
+Binding Details Configured..
+Performing Binding..
+Binding Performed Successfully..
+Converting sockets into listening Sockets..
+listening Sockets Created..
+Calling select() on Listening sockets till member 6 of read set..
+select() returned..
+sock_fd_lh is set..
+Connection accepted on descriptor: 6
+New thread created..
+Calling select() on Listening sockets till member 6 of read set..
+
+Struct contents
+
+options enabled: 1
+options type: f
+parameter count: 3
+parameter[0]: 1
+parameter[1]: /home/bhojas/Documents/
+parameter[2]: /home/bhojas/Desktop/
+dest. ip:     127.0.0.1
+hash:         KM6iSBrp1HHnVFmVuTiRs1
+parsing arguements..
+Option selected: sanbackup -f nmin <src> <dest>..
+or
+Option selected: sanbackup -f nmin <src> <dest> <ip>..
+new_backup()..
+Acquired mutex lock on: &backup.mutex
+src: /home/bhojas/Documents/
+dest: /home/bhojas/Desktop/
+backup_op configured..
+Configuring backup_id node..
+search_node() called..
+Serching node: </home/bhojas/Documents/,/home/bhojas/Desktop/,127.0.0.1,0>
+Empty list..No searching performed..
+Forking child to handle requested backup operation..
+backup_id node configured..
+Adding backup_id node to backup_id_list..
+Inserting node: </home/bhojas/Documents/,/home/bhojas/Desktop/,127.0.0.1,4471>
+List is empty...
+Node will be inserted as the first elem
+Successfully inserted node into the backup_id_list..
+Released mutex lock on: &backup.mutex
+Successfully configured new backup..
+Bytes written to socket: 38
+Trying to close the Descriptor: 6
+Successfully Closed the Descriptor: 6
+select() returned..
+[Select]sock_fd_rh is set..
+[Select]Connection accepted on descriptor: 6
+New thread created..
+Calling select() on Listening sockets till member 6 of read set..
+[RECIVER]Inside recv_backup_data()..
+[RECIVER]Receiving details of backup from remote Daemon..
+Year: 2016
+Month: 5
+Day: 22
+Hour: 15
+Min: 13
+Sec: 49
+New dir name is: 20160522151349
+Backup file stats received successfully (abs_dest: /home/bhojas/Desktop/20160522151349/test)
+Full backup will be performed..
+[RECIVER]Receiving file contents to be backed up..
+File opened successfully: /home/bhojas/Desktop/20160522151349/test
+File : /home/bhojas/Desktop/20160522151349/test nbytes: 219
+File : /home/bhojas/Desktop/20160522151349/test Read bytes: 219
+Successfully Received backup file contents(/home/bhojas/Desktop/20160522151349/test) by remote Daemon..
+Trying to close the Descriptor: 7
+Successfully Closed the Descriptor: 7
+preserve_ownership() Called
+preserve_timestamps() Called
+Reading next file..
+Backup file stats received successfully (abs_dest: /home/bhojas/Desktop/20160522151349/test3)
+Full backup will be performed..
+[RECIVER]Receiving file contents to be backed up..
+File opened successfully: /home/bhojas/Desktop/20160522151349/test3
+File : /home/bhojas/Desktop/20160522151349/test3 nbytes: 440
+File : /home/bhojas/Desktop/20160522151349/test3 Read bytes: 440
+Successfully Received backup file contents(/home/bhojas/Desktop/20160522151349/test3) by remote Daemon..
+Trying to close the Descriptor: 7
+Successfully Closed the Descriptor: 7
+preserve_ownership() Called
+preserve_timestamps() Called
+Reading next file..
+Backup file stats received successfully (abs_dest: /home/bhojas/Desktop/20160522151349/test2)
+Full backup will be performed..
+[RECIVER]Receiving file contents to be backed up..
+File opened successfully: /home/bhojas/Desktop/20160522151349/test2
+File : /home/bhojas/Desktop/20160522151349/test2 nbytes: 274
+File : /home/bhojas/Desktop/20160522151349/test2 Read bytes: 274
+Succemon..
+Successfully sent backup file stats to remote Daemon..
+Waiting for Contents Transfer Confirmation..
+File Contents Transfer Confirmation received from Remote Daemon: y
+[4471] /home/bhojas/Documents/test is a file..
+Sending backup file content to remote Daemon..
+Opening file: /home/bhojas/Documents/test
+File opened successfully,,
+FILE: /home/bhojas/Documents/test SIZE: 219
+/home/bhojas/Documents/test READ BYTES: 219
+Successfully sent backup file stats to remote Daemon..
+Trying to close the Descriptor: 7
+Successfully Closed the Descriptor: 7
+preserve_timestamps() Called
+[4471]File: ..
+[4471]".." encountered..Ignoring it..
+[4471]File: .
+[4471]"." encountered..Ignoring it..
+[4471]File: test3
+[4471]Generating Absolute path of src. file..
+Arg0: 1
+updated len: 2
+Arg0: /home/bhojas/Documents/
+updated len: 25
+Arg1: test3
+updated len: 30
+[4471]Absolute path of src. file: /home/bhojas/Documents/test3[4471]Generating Absolute path of dest. file..
+Arg0: 1
+updated len: 2
+Arg0: /home/bhojas/Desktop/20160522151349/
+updated len: 38
+Arg1: test3
+updated len: 43
+[4471]Absolute path of Dest.file: /home/bhojas/Desktop/20160522151349/test3
+[4471]Getting stats of file: /home/bhojas/Documents/test3
+[4471]Successfuly retrieved the stats of file: /home/bhojas/Documents/test3
+Sending backup file stats to remote Daemon..
+Successfully sent backup file stats to remote Daemon..
+Waiting for Contents Transfer Confirmation..
+File Contents Transfer Confirmation received from Remote Daemon: y
+[4471] /home/bhojas/Documents/test3 is a file..
+Sending backup file content to remote Daemon..
+Opening file: /home/bhojas/Documents/test3
+File opened successfully,,
+FILE: /home/bhojas/Documents/test3 SIZE: 440
+/home/bhojas/Documents/test3 READ BYTES: 440
+Successfully sent backup file stats to remote Daemon..
+Trying to close the Descriptor: 7
+Successfully Closed the Descriptor: 7
+preserve_timestamps() Called
+[4471]File: test2
+[4471]Generating Absolute path of src. file..
+Arg0: 1
+updated len: 2
+Arg0: /home/bhojas/Documents/
+updated len: 25
+Arg1: test2
+updated len: 30
+[4471]Absolute path of src. file: /home/bhojas/Documents/test2[4471]Generating Absolute path of dest. file..
+Arg0: 1
+updated len: 2
+Arg0: /home/bhojas/Desktop/20160522151349/
+updated len: 38
+Arg1: test2
+updated len: 43
+[4471]Absolute path of Dest.file: /home/bhojas/Desktop/20160522151349/test2
+[4471]Getting stats of file: /home/bhojas/Documents/test2
+[4471]Successfuly retrieved the stats of file: /home/bhojas/Documents/test2
+Sending backup file stats to remote Daemon..
+Successfully sent backup file stats to remote Daemon..
+Waiting for Contents Transfer Confirmation..
+File Contents Transfer Confirmation received from Remote Daemon: y
+[4471] /home/bhojas/Documents/test2 is a file..
+Sending backup file content to remote Daemon..
+Opening file: /home/bhojas/Documents/test2
+File opened successfully,,
+FILE: /home/bhojas/Documents/test2 SIZE: 274
+/home/bhojas/Documents/test2 READ BYTES: 274
+Successfully sent backup file stats to remote Daemon..
+Trying to close the Descriptor: 7
+Successfully Closed the Descriptor: 7
+preserve_timestamps() Called
+[Sender]send_backup_data() returned..
+Sending Empty backup file stat struct to remote Daemon to indicate end of data transfer..
+Successfully sent empty backup file stat struct to remote Daemon..
+Trying to close the Descriptor: 4
+Successfully Closed the Descriptor: 4
+[4471]File opened successfully..
+[4471]Configuring lock..
+[4471]Lock configured..
+[4471]Trying to acquire lock on file..
+[4471]Lock acquired..
+[4471]Data(2332 bytes) written successfully to file..
+[4471]Releasing file lock..
+[4471]Lock released..
+[4471]File closed..
+
+[4471]waiting for signal..
+[4471]SIGALRM received..
+[Sender]Creating Socket..
+[Sender]Socket Created: 4..
+[Sender]Configuring Connnection Details..
+[Sender]Connnection Details Configured Successfully..
+[Sender]Trying to Connect with Daemon..
+[Sender]Connection Established with Daemon..
+[Sender]Sending details of backup to remote Daemon..
+[Sender]b_op struct sent successfully to remote Daemon..
+[Sender]Flag received from Remote Daemon: y
+[Sender]B

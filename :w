@@ -1,0 +1,3619 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<sys/types.h>
+#include<sys/stat.h>
+#include<fcntl.h>
+#include<errno.h>
+#include<sys/time.h>
+#include<signal.h>
+#include<sys/ipc.h>
+#include<sys/shm.h>
+#include<string.h>
+#include<time.h>
+#include<unistd.h>
+#include<sys/mman.h>
+#include<unistd.h>
+#include<dirent.h>
+#include<utime.h>
+#include<stdarg.h>
+#include<pthread.h>
+#include<netinet/in.h>
+#include<sys/socket.h>
+#include<arpa/inet.h>
+#include<sys/wait.h>
+#include"backup.h"
+#include"ipc.h"
+#include"filestats.h"
+#include"lock.h"
+#include"stdops.h"
+#include"backup_id.h"
+
+
+
+static int fifofd_wr;			//file descriptor of fifo meant for writing data from daemon to util
+static int d_pid;			//daemon process id
+static int pid[MAX_CHILD];		//store pid of child's that perform backup operation
+static int child_ctr = -1;			//index num of pid[], (num. of child's that perform backup operation, forked)
+
+int sock_fd_lh 		= 0;			//listening socket file descriptor for Local Host
+int sock_fd_rh 		= 0;			//listening socket file descriptor for Remote Host
+////////
+//Imp://
+//////////////////////////////////////////
+//Order of locking:			//
+//	&dflt_backup_interval.mutex	//
+//		|			//
+//		---- &backup.mutex	//
+//					//
+//////////////////////////////////////////
+struct
+{
+	pthread_mutex_t mutex;		//synchronise access to default backup interval
+	int value;	//default backup interval
+}dflt_backup_interval = { PTHREAD_MUTEX_INITIALIZER, DFLT_BACKUP_INTERVAL};
+
+struct
+{
+	pthread_mutex_t mutex;		//synchronise access to the struct that stores info. about currently processed backup operation
+	struct backup_op b_op;		//struct to store info about backup operation to be performed
+}backup = {PTHREAD_MUTEX_INITIALIZER, 0}; 
+
+//////////////////////////////////////////////////////////////////
+//List of backup ops. to be kept by daemon                      //
+//and not by its childrens that handle individual backups       //
+//////////////////////////////////////////////////////////////////
+struct
+{
+        struct backup_id*       head;   //head of the list 
+        pthread_mutex_t         mutex;  //mutex for synchronisation of list operations 
+}backup_id_list={NULL, PTHREAD_MUTEX_INITIALIZER};                     //pg. 168 UNP2 
+
+
+
+//Close a Descriptor
+//Args:
+//	d:	descriptor
+//	action:	What to do When close Operation Fails?
+//		0 		=	Do nothing
+//		Otherwise	=	Exit
+//returns:
+//	nothing
+void close_descriptor(int d, int action)
+{
+	printf("Trying to close the Descriptor: %d\n", d);
+	if(-1 == close(d))
+	{
+		printf("Failed to close Descriptor: %d\n", d);
+		if(action)
+		{
+			exit(1);
+		}
+	}
+	else
+	{
+		printf("Successfully Closed the Descriptor: %d\n", d);
+	}	
+}
+
+
+
+
+//generate a timestamp of the format YYYYMMDDHHMMSS (Year Month Day Hour Minute Seconds)
+//and store timestamp at location pointed by character pointer passed as arguement 
+//
+//args:
+//	|-str: character string in which dirname is to be stored
+//NOTE:
+//	|-character string must be big enough to store timestamp and string terminator
+//
+//returns:
+//	nothing
+void get_new_dirname(char* str)
+{
+	time_t tm_s;				//store seconds since epoch time
+        struct tm time_s;			//store date and time fields broken into parts
+
+        tm_s = time(NULL);			//obtain seconds since epoch
+        localtime_r(&tm_s, &time_s);	//obtain date and time fields broken into parts
+	
+	int year = time_s.tm_year + 1900;
+	int mon = time_s.tm_mon + 1;
+	int day = time_s.tm_mday;
+	int hour = time_s.tm_hour;
+	int min  = time_s.tm_min;
+	int sec = time_s.tm_sec;
+
+        printf("Year: %d\n", time_s.tm_year + 1900);
+        printf("Month: %d\n", time_s.tm_mon + 1);
+        printf("Day: %d\n", time_s.tm_mday);
+        printf("Hour: %d\n", time_s.tm_hour);
+        printf("Min: %d\n", time_s.tm_min);
+        printf("Sec: %d\n", time_s.tm_sec);
+
+	//store year (0 to 3 bytes)	
+	sprintf(str, "%d", year);
+	//store month (4th and 5th byte)
+	if((mon / 10) == 0)
+	{
+		str[4] = '0';
+		str[5] = 48 + mon;
+	}
+	else
+	{
+		str[5] = (mon%10) + 48;
+		mon = mon/10;
+		str[4] = (mon%10) + 48;
+	}
+	//store day (6th and 7th byte)
+	if((day / 10) == 0)
+	{
+		str[6] = '0';
+		str[7] = 48 + day;
+	}
+	else
+	{
+		str[7] = (day%10) + 48;
+		day = day/10;
+		str[6] = (day%10) + 48;
+	}
+	//store hour (8th and 9th byte)
+	if((hour / 10) == 0)
+	{
+		str[8] = '0';
+		str[9] = 48 + hour;
+	}
+	else
+	{
+		str[9] = (hour%10) + 48;
+		hour = hour/10;
+		str[8] = (hour%10) + 48;
+	}
+	//store min (10th and 11th byte)
+	if((min / 10) == 0)
+	{
+		str[10] = '0';
+		str[11] = 48 + min;
+	}
+	else
+	{
+		str[11] = (min%10) + 48;
+		min = min/10;
+		str[10] = (min%10) + 48;
+	}
+	//store sec (12th and 13th byte)
+	if((sec / 10) == 0)
+	{
+		str[12] = '0';
+		str[13] = 48 + sec;
+	}
+	else
+	{
+		str[13] = (sec%10) + 48;
+		sec = sec/10;
+		str[12] = (sec%10) + 48;
+	}
+	//nul char
+	str[14] = '\0';
+}
+
+
+
+//handler for SIGCHLD signal
+//(SIGCHLD is generated by child when it exists and is sent to parent)
+void sigchld_handler(int sig)
+{
+	int cpid;
+	struct backup_id* node;
+
+	if((cpid = wait(NULL)) == -1)
+	{
+		printf("Error encountered while waiting for child..\n");
+		perror("wait");	
+	}	
+	else
+	{
+		printf("child with pid: %d exited..\n", cpid);
+		printf("Removing entry corresponding to this child from backup_id_list(if the entry exists)..\n");
+		node = getnode(&backup_id_list.mutex);
+		node->pid = cpid;
+		if(-1 == delete_node(&backup_id_list.head, node, &backup_id_list.mutex))
+		{
+			printf("Entry doesnot exists in list..\n");
+		}
+		else
+		{
+			printf("Entry successfully deleted from the list..\n");
+		}
+
+	}
+}
+
+
+
+
+//generate absolute path using passed args and return the string
+//args:
+//	|- extra_bytes : apart from passed args to be used to generate abs. path, how many extra bytes should be allocated 
+//	|- ...(varargs): character strings to be used to generate path
+//	
+//returns:
+//	|- abs_path character string on success
+//	|- NULL on failure
+//Eg1:
+//	abs_path(0, "dir", "/", "dir", "/", "src", NULL);
+//	generates string:
+//			dir/dir/src\0
+//
+//Eg2:
+//	abs_path(0, "dir/", "/", "dir", "/", "src", NULL);
+//	generates string:
+//			dir//dir/src\0	(which ofcourse we didn't intended to)
+//			so, we careful with what you pass
+//
+//Eg3:
+//	abs_path(1, "dir/", "dir", "/", "src", NULL);
+//	generates string:
+//			dir/dir/src\0\0	(one extra byte generated as requested)
+//
+//			used when we might explcitly want to append some additional data to the string s.a. a "/" depending upon whether 
+//			path represents dir or other file.
+//
+//
+//NOTES:
+//	1) Don't forget to pass NULL as the last arg. (just as in exec() family calls)
+//	2) No need to explicitly specify "\0" at the end
+//		abs_path(0, "dir", "/", "dir", "/", "src", "\0", NULL);
+//
+//
+//
+char* abs_path(int extra_bytes, ...)
+{
+	char* result;
+	char* arg;
+	va_list vargp;
+	int i = 0;
+	int len = 1;	//for "\0" at the end of the string
+
+
+	//cal. total amount of mem. to be allocated (in bytes)
+	va_start(vargp, extra_bytes);
+
+	printf("Arg0: %d\n", extra_bytes);
+	len += extra_bytes;
+	printf("updated len: %d\n", len);
+
+
+	while((arg = va_arg(vargp, char *)) != NULL)
+	{
+		printf("Arg%d: %s\n", i++,  arg);
+		len += strlen(arg);
+		printf("updated len: %d\n", len);
+	}
+
+	va_end(vargp);
+
+	//generate string 
+	result = calloc(len, sizeof(char));
+	if(result == NULL)
+	{
+		printf("Failed to allocate memory..\n");
+		return NULL;
+	}
+
+	va_start(vargp, extra_bytes);	
+	while((arg = va_arg(vargp, char *)) != NULL)
+	{
+		strcat(result, arg);
+	} 
+	strcat(result, "\0");
+
+	va_end(vargp);
+
+	return result;
+}
+
+
+/*
+check whether a file exists or not
+args:
+	abs_path:	absolute path of the file whose existance is to be determined
+returns:
+	0:	file exists
+	-1:	file doesnot exists
+NOTE:
+	This function simply checks whether  file exists or not.
+	File permissions are irrelevent for this function.
+	Eg:	Let, /dir/dir/f
+			can be accessed only by root.
+			Suppose, user "foo" tries to check its existance.
+			In this case, this function will return 0(file exists), even though foo can't access it.
+*/
+int file_exists(char* abs_path)
+{
+	static struct stat buf;
+	printf("Checking the existance of the file: %s\n", abs_path);
+	if(-1 == stat(abs_path, &buf))
+	{
+		printf("File doesnot exists..\n");
+		perror("stat");
+		return -1;
+	}
+	printf("File exists..\n");
+	return 0;	
+
+}
+
+
+
+
+/*
+
+//Backup file
+//args:
+//	absolute path of source file
+//	absolute path of dest file
+//	file stats
+//returns:
+//	0 on success
+//	-1 on failure
+int backup_file(char* src, char* dest, struct stat* filestat_buf)
+{
+		int cpid;
+		int srcfd;
+		int destfd;
+		int nbytes;
+		char buf[BUFSIZE];
+
+		cpid = getpid();
+
+		//open src file	
+		printf("[%d]BACKUP: generating source fd..\n", cpid);
+		srcfd = open(src, O_RDONLY);
+		if(srcfd == -1)
+		{
+			perror("open");
+			return -1;
+		}	
+		printf("[%d]BACKUP: source fd: %d\n", cpid, srcfd);
+
+		//open dest file
+		printf("[%d]BACKUP: generating dest fd..\n", cpid);
+		destfd = open(dest, O_WRONLY|O_CREAT, 0644);
+		if(destfd == -1)
+		{
+			perror("open");
+			close(srcfd);
+			return -1;
+		}	
+		printf("[%d]BACKUP: dest fd: %d\n", cpid, srcfd);
+
+
+		//copy contents 
+		//read from src file and write to dest file
+		printf("[%d]BACKUP: %s is being backed up..\n", cpid, src);
+		while((nbytes = read(srcfd, buf, BUFSIZE)))
+		{
+			//error while reading
+			if(nbytes == -1)
+			{
+				perror("read");
+				close(srcfd);
+				close(destfd);
+				return -1;
+			}
+			//end of file reached
+			//else if(nbytes == 0)
+			//{
+			//	break;
+			//}
+			//write read bytes to destination file
+			else if(write(destfd, buf, nbytes) == -1)
+			{
+				perror("write");
+				close(srcfd);
+				close(destfd);
+				return -1;
+			}
+		}
+		printf("[%d]BACKUP: %s succesfuly backed up..\n", cpid, src);
+
+		close(srcfd);
+		close(destfd);
+
+		//preserve 
+		//	+ ownership
+		//	+ modification time
+		//	+ access time
+		//
+		//Since, we have implemented our own version of copy command,
+		//Access time of src file gets changed.
+		//But we have a preserved copy of the stats of the file
+		//(passed as a arguement to this function)
+		//Hence, we can use that to restore the timestamps.
+		if(-1 == preserve_timestamps(src, filestat_buf))
+		{
+			printf("Failed to preserved the Timestamps of file: %s\n", src);
+		}
+		else
+		{
+			printf("Successfully preserved the Timestamps of file: %s\n", src);
+		}
+
+		if(-1 == preserve_timestamps(dest, filestat_buf))
+		{
+			printf("Failed to preserved the Timestamps of file: %s\n", dest);
+		}
+		else
+		{
+			printf("Successfully preserved the Timestamps of file: %s\n", src);
+		}
+
+		if(-1 == preserve_ownership(dest, filestat_buf))
+		{
+			printf("Failed to preserved the Ownership of file: %s\n", dest);
+		}
+		else
+		{
+			printf("Successfully preserved the Ownership of file: %s\n", dest);
+		}
+
+		return 0;
+}
+
+*/
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////
+//check whether a file or dir. exists within another dir.
+//
+//args:
+//	|-name of file/dir to be searched
+//	|-absolute path of directory within which file/dir name is searched for existance
+//
+//returns:
+//	|-NULL						: if no matching entry is found
+//	|-absolute path of file/dir that was searched	: if matching entry is found
+//
+//Note:		
+//	fn. returns absolute src. as per the type of file
+//	i.e. in the format 	/dir/dir/src		if src. is not a directory	<-------
+//					or							|
+//	in the format 		/dir/dir/src/ 		if src. is a directory	<-------	|
+//											|	|
+//Eg:											|	|
+//	songs										|	|	
+//	  |--------hindi								|	|
+//	  |--------english								|	|
+//		|----------Eminem							|	|
+//	  |--------punjabi								|	|
+//	  |--------tamil								|	|
+//	  |--------bengali								|	|
+//											|	|
+//											|	|
+//	find("english", "/home/user/songs")						|	|
+//		returns: /home/user/songs/english/		------------------------	|
+//												|
+//	find("Eminem", "/home/user/songs")							|
+//		returns: /home/user/songs/english/Eminem	--------------------------------
+//
+//	find("troll", "/home/user/songs");
+//		returns: NULL 
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+void* find(char* entry_name, char* abs_dir)
+{
+	char* abs_cur = NULL;	//abs. path of dir. entry inside current directory
+	DIR*  dirp = NULL;		//directory pointer
+	struct dirent *direntry = NULL;	//directory entry
+	struct stat buf;	//hold stats of a file
+	int len = 0;
+	char* ret = NULL;		//temp var to hold return val
+
+	printf("Opening directory: %s\n", abs_dir);
+	if((dirp = opendir(abs_dir)) == NULL)
+	{
+		printf("Failed to open: %s\n", abs_dir);
+		perror("opendir");
+		return NULL;
+	}
+	printf("directory opened..\n");
+
+	while((direntry = readdir(dirp)) != NULL)
+	{
+		/*On Linux, the dirent structure is defined as follows:
+
+		   struct dirent {
+		       ino_t          d_ino;       // inode number 
+		       off_t          d_off;       // offset to the next dirent 
+		       unsigned short d_reclen;    // length of this record 
+		       unsigned char  d_type;      // type of file; not supported
+						   //  by all file system types 
+		       char           d_name[256]; // filename 
+		   };
+		*/
+
+		printf("directory entry encountered: %s\n", direntry->d_name);
+
+		if((0 == strcmp(".", direntry->d_name)) || (0 == strcmp("..", direntry->d_name)))
+		{
+			printf("\".\" or \"..\" encountered..Skipping it..\n");
+			continue;
+		}
+
+		//generate absolute path of current entry
+		//	   /abs_dir/ + entry_name + / + \0
+		//				    ^
+		//				    |-------- will be added only if current entry is a dir.
+		printf("generating absolute path of current entry..\n");
+		/*abs_cur = calloc(strlen(abs_dir) + strlen(direntry->d_name) + 1 + 1, sizeof(char));
+		strcat(abs_cur, abs_dir);	
+		strcat(abs_cur, direntry->d_name);	
+		strcat(abs_cur, "\0");	
+		*/
+		if((abs_cur = abs_path(1, abs_dir, direntry->d_name, NULL)) == NULL)
+		{
+			printf("Failed to generate absolute path of current entry: %s\n", abs_cur);
+		}
+		printf("absolute path of current entry: %s\n", abs_cur);
+
+
+		//retrieve file stats
+		printf("Retreiving file stats..\n");
+		if(-1 == lstat(abs_cur, &buf))
+		{
+			printf("Failed to fetch stats of file: %s .Ignoring it...\n", abs_cur);
+			perror("lstat");
+			continue;
+		}
+		printf("File stats retreived successfully..\n");
+
+
+		//check whether current directory entry is the one that we are looking for
+		//and update absolute src. as per the type of file(if reqd.)
+		// i.e. in the format 	/dir/dir/src		if src. is not a directory
+		//				or
+		//in the format 	/dir/dir/src/ 		if src. is a directory
+		printf("Checking whether current directory entry is the one that we are looking for..\n");
+		printf("Comparing: %s and %s\n", entry_name, direntry->d_name);
+		if(0 == strcmp(entry_name, direntry->d_name))
+		{
+			printf("MATCH FOUND..\nFile exists..\n");
+			if(S_ISDIR(buf.st_mode))
+			{
+				strcat(abs_cur, "/");
+				strcat(abs_cur, "\0");
+			}
+			return abs_cur;
+		}
+		else
+		{
+			printf("MATCH NOT FOUND..\n");
+
+			if(S_ISDIR(buf.st_mode))
+			{
+				printf("%s is a directory..\n", abs_cur);
+				//since current entry is a directory, update its absolute path
+				len = strlen(abs_cur);
+				abs_cur[len] = '/';
+				abs_cur[len + 1] = '\0';
+				printf("Moving inside: %s\n", abs_cur);
+				if((ret = find(entry_name, abs_cur)) != NULL)
+				{
+					free(abs_cur);
+					if(-1 == closedir(dirp))
+					{
+						printf("Failed to close the directory stream..\n");
+						perror("closedir");
+					}
+					return ret;	//Match found within a sub-directory, return abs. path of file 
+				}
+				printf("Coming out of: %s\n", abs_cur);
+			}
+		}//end of else
+		
+		free(abs_cur);
+
+	}//end of while
+
+	printf("No match found(or entry ignored.. please make sure necessary file permissions exist)..Returning NULL..\n");
+	if(-1 == closedir(dirp))
+	{
+		printf("Failed to close the directory stream..\n");
+		perror("closedir");
+	}
+	return NULL;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+//perform backup
+//args:
+//	* abs. path of dir from which files are to be retreived
+//	* abs. path of dir where files are to be stored
+//	* tentative backup counter (which backup is this 0th, 1st etc..??)
+//
+//Note:
+//	|-abs. path passed in args must have "/" at the end.
+//	|-Eg: 	/dir/dir/srcdir/	<------------- correct format 
+//	|-	/dir/dir/srcdir		<------------- incorrect format
+//	|-dir's whose abs. path is passed to this function, must exist.
+//	|-This. func. won't create above mentioned dir's if they don't exist.
+//	
+//returns:
+//	n :	number of files successfully backed up (excluding the directories)
+//
+int perform_backup(char* abs_src, char* abs_dest, int backup_ctr)
+{
+	DIR* src_dir;
+	struct dirent* dent;	//directory entry
+	int cpid;
+	char* abs_src_file;	//absolute path of src. file
+	char* abs_dest_file;	//absolute path of dest. file
+	char* abs_prev_dest;	//absolute path of prev. backup dest 
+	char* abs_prev_dest_file;	//absolute path of current src file in prev. backup dest (if it was backed up during any prev. operation) 
+
+	struct stat prev_file_stat;	//stats of file as per prev. backup
+	struct stat cur_file_stat;	//latest stats of file in src. dir.
+	int size;			//temp var to hold size of strings
+	unsigned int num_files_backed =  0;	//number of files backed up during this operation
+	short do_backup_file = 1;		//var. tells whether to backup a file or not
+						//0: don't backup
+						//1: backup
+	int temp;
+
+
+
+	cpid = getpid();
+
+	printf("[%d]Args received in perform_backup()..\n", cpid);
+	printf("[%d]abs_src: %s..\n", cpid, abs_src);
+	printf("[%d]abs_dest: %s..\n", cpid, abs_dest);
+	printf("[%d]Tentative backup_ctr: %d..\n", cpid, backup_ctr);
+
+	/////////////////////
+	//open directories
+	//////////////////////////
+	printf("[%d]Opening directory: %s\n", cpid, abs_src);	
+	if((src_dir = opendir(abs_src)) == NULL)
+	{
+		if(errno == EACCES)
+		{
+			printf("[%d]Access denied to open: %s\n", cpid, abs_src);
+		}
+		perror("opendir");
+		return num_files_backed;
+	}
+	printf("[%d]Directory %s opened successfully..\n", cpid, abs_src);
+
+	
+
+	/////////////////////////////////////////////
+	//Perform operation on each directory entry
+	////////////////////////////////////////////	
+	while((dent = readdir(src_dir)) != NULL)
+	{
+		printf("[%d]File: %s Size: %d\n", cpid, dent->d_name, sizeof(dent->d_name));
+		///////////////////////////
+		//Ignore "." and ".."
+		//////////////////////////
+		if(dent->d_name[0] == '.' && dent->d_name[1] == '\0')
+		{
+			printf("[%d]\".\" encountered..Ignoring it..\n", cpid);
+			continue;
+		}	
+		if(dent->d_name[0] == '.' && dent->d_name[1] == '.' && dent->d_name[2] == '\0')
+		{
+			printf("[%d]\"..\" encountered..Ignoring it..\n", cpid);
+			continue;
+		}	
+
+		///////////////////////////////////////
+		//generate absolute path for filename
+		//////////////////////////////////////
+		printf("[%d]Generating Absolute path of src. file..\n", cpid);
+		//Assumption:
+		//	abs_src will of the form: /abc/def/
+		//	filename will be of the form:	xyz
+		//	We generate abs_src_file name as: /abc/def/xyz\0
+		//	But we allocate one byte extra(excluding '\0')
+		//	So that, we can append '/' at the end if cur. file is a dir
+		//	i.e. abs_src_file name becomes: /abc/def/xyz/\0
+		//	So, that during recursion, abs_src remains of the form /abc/def/xyz/
+		//
+		//Why used above aproach rather than directly appending "/" here itself at the end?
+		//
+		//Because:	format /abc/def/xyz/
+		//		specifies that xyz is also a dir (because only dir's contain a "/" at the end
+		//	
+		//		Now assume that xyz is a file
+		//		When we pass this path to stat() family fn's, they report an error regarding
+		//		one of the members of path /abc/def/xyz/ is not a dir..
+		//		which is true, since xyz is not a dir.
+		//		Hence, to handle this case, we pass only /abc/def/xyz to stat() family fn's
+		//		and append "/" at the end only if xyz is a directory
+		//	
+		if((abs_src_file = abs_path(1, abs_src, dent->d_name, NULL)) == NULL)
+		{
+			printf("[%d]Failed to generate Absolute path of src. file: %s", cpid, abs_src_file);
+			continue;
+		}
+		printf("[%d]Absolute path of src. file: %s", cpid, abs_src_file);
+
+
+		printf("[%d]Generating Absolute path of dest. file..\n", cpid);
+		//Assumption:
+		//	abs_dest will of the form: /abc/def/
+		//	filename will be of the form:	xyz
+		//	We generate abs_dest name as: /abc/def/xyz\0
+		//	But we allocate one byte extra(excluding '\0')
+		//	So that, we can append '/' at the end if cur. file is a dir
+		//	i.e. abs_dest_file name becomes: /abc/def/xyz/\0
+		//	So, that during recursion, abs_dest remains of the form /abc/def/xyz/
+		if((abs_dest_file = abs_path(1, abs_dest, dent->d_name, NULL)) == NULL)
+		{
+			printf("[%d]Failed to generate Absolute path of dest file: %s", cpid, abs_dest_file);
+			free(abs_src_file);
+			continue;
+			//return -1;
+		}
+		printf("[%d]Absolute path of Dest.file: %s\n", cpid, abs_dest_file);
+
+
+
+		//////////////////////////////////
+		//get stats of  cur. file
+		/////////////////////////////////
+		printf("[%d]Getting stats of file: %s\n", cpid, abs_src_file);
+		
+		if(-1 == lstat(abs_src_file, &cur_file_stat))
+		{
+			if(errno == EACCES)
+			{
+				printf("[%d]Skipping File: Permission denied to read to stats of the file: %s\n", cpid, abs_src_file);
+			}
+			perror("lstat");
+			free(abs_src_file);
+			free(abs_dest_file);
+			continue;
+		}
+		printf("[%d]Successfuly retrieved the stats of file: %s\n", cpid, abs_src_file);
+	
+
+
+
+		//////////////////////////////////
+		//If cur. file is a dir
+		/////////////////////////////////
+		if(S_ISDIR(cur_file_stat.st_mode))
+		{
+			printf("[%d] %s is a directory..\n", cpid, abs_src_file);	
+			printf("[%d] Making directory of this name in dest: %s..\n", cpid, abs_dest_file);
+			if(-1 == mkdir(abs_dest_file, 0744))
+			{
+				if(errno == EACCES)
+				{
+					printf("[%d]Skipping DIR: Permission denied to make dir in dest: %s\n", cpid, abs_dest_file);
+				}
+				perror("mkdir");
+				free(abs_src_file);
+				free(abs_dest_file);
+				continue;
+			}
+			printf("[%d] Successuflly created directory of this name in dest: %s..\n", cpid, abs_dest_file);
+
+			//Preserve Timestamps
+			if(-1 == preserve_timestamps(abs_dest_file, &cur_file_stat))
+			{
+				printf("Failed to Preserve the Timestamps of: %s\n", abs_dest_file);
+			}
+			else
+			{
+				printf("Successfully Preserved the Timestamps of: %s\n", abs_dest_file);
+			}
+
+			//Preserve Ownership 
+			if(-1 == preserve_ownership(abs_dest_file, &cur_file_stat))
+			{
+				printf("Failed to Preserve the Ownership of: %s\n", abs_dest_file);
+			}
+			else
+			{
+				printf("Successfully Preserved the Ownership of: %s\n", abs_dest_file);
+			}
+
+			printf("[%d] Moving inside: %s\n", cpid, abs_src_file);
+
+			size = strlen(abs_src_file);
+			printf("[%d] length of abs. src. file path: %d\n", cpid, size);
+			abs_src_file[size] = '/';
+			abs_src_file[size+1] = '\0';
+			printf("[%d] Updated abs. src. file path: %s\n", cpid, abs_src_file);
+			
+			size = strlen(abs_dest_file);
+			abs_dest_file[size] = '/';
+			abs_dest_file[size+1] = '\0';
+			printf("[%d] Updated abs. dest. file path: %s\n", cpid, abs_dest_file);
+
+			//printf("**********************\n");
+			//Recursively try to backup the contents of directory
+			//If error Occurs while performing backup /or/ no files to backup
+			//Remove newly created directory from dest
+			if((temp = perform_backup(abs_src_file, abs_dest_file, backup_ctr)) == 0)
+			{	
+				printf("Num files backed During this operation: %d\n", temp);
+				printf("Error while performing backup /or/ no files to backup in dir: %s\n", abs_src_file);
+				if(-1 == rmdir(abs_dest_file))	//since newly created dest dir. is empty because no files were recovered into it
+				{				//Hence, delete it.
+					printf("Failed to remove directory: %s\n", abs_dest_file);	
+					perror("rmdir");
+				}
+				else
+				{
+					printf("Directory removed successfully: %s\n", abs_dest_file);	
+				}
+				free(abs_src_file);
+				free(abs_dest_file);
+				continue;
+			}
+			else	//temp number of files were backed up 
+			{
+				num_files_backed += temp;
+			}
+
+			
+			printf("Num files backed During this operation: %d\n", temp);
+			printf("Overall files backed till now: %d\n", num_files_backed);
+			printf("[%d] Moving out of: %s\n", cpid, abs_src_file);
+			
+			
+		}
+		//////////////////////////////////
+		//If cur. file is not a dir
+		/////////////////////////////////
+		else
+		{
+			printf("[%d] %s is a file..\n", cpid, abs_src_file);	
+			do_backup_file = 1;
+
+
+			if(backup_ctr != 0)
+			{
+				printf("Tentative backup ctr: %d\n", backup_ctr);
+
+				temp = backup_ctr;
+				//from last backup till first backup
+				while(--temp >= 0)
+				{
+					//generate abs. path of the file with which it would have been backed during prev backup
+					printf("Generating abs. path of file %s as per backup num: %d\n", dent->d_name, temp);
+
+
+					//as of now abs_prev_dest contains abs. path of the dir. that contains contents of prev. backup
+					//scrutinised currently	
+					if((abs_prev_dest = abs_path(0, b_op.dest, b_op.last_bt[temp], "/", NULL)) == NULL)
+					{
+						printf("Failed to generate Absolute path of dir. that "
+							"contains %s during older backup(num: %d)", dent->d_name, temp);
+						break;	//backup file as a precautionary measure
+					}
+
+					//find abs. path of current directory entry in prev. backup dest.
+					if((abs_prev_dest_file = find(dent->d_name, abs_prev_dest)) == NULL)
+					{
+						printf("Failed to generate Absolute path of %s w.r.t."
+							" older backup(num: %d) i.e. file not found..", dent->d_name, temp);
+						free(abs_prev_dest);	
+						continue;	//try to find file file in the backup done before the currently scrutinised backup.  
+					}
+					else
+					{
+						free(abs_prev_dest);	
+						printf("Absolute path of file %s during backup(num: %d) should be"
+							"(If it was backed up): %s", dent->d_name, temp, abs_prev_dest_file);
+
+			//	
+			//		//if file doesnot exists in prev. backup	
+			//		printf("Checking whether file exists..\n");
+			//		if(-1 == file_exists(abs_prev_dest))
+			//		{
+			//			printf("File doesnot exists at location: %s\n", abs_prev_dest);
+			//			free(abs_prev_dest);	
+			//			free(abs_src_file);
+			//			free(abs_dest_file);
+			//			continue;	//try to find file file in the backup done before the currently scrutinised backup.  
+			//		}
+			//		else	//file exists in prev. backup currently scrutinised
+			//		{
+			//
+						//fetch stats of file as per prev. backup and check whether 
+						//currently we have a dirty copy of file(which then must be backed up)
+						//or an untouched copy of file(which doesnot need to be backed)
+						printf("file exists..\n");
+						printf("Getting stats of file: %s\n", abs_prev_dest_file);
+						
+						if(-1 == lstat(abs_prev_dest_file, &prev_file_stat))
+						{
+							if(errno == EACCES)
+							{
+								printf("Skipping File: Permission denied to read"
+									" the stats of the file: %s\n", abs_prev_dest_file);
+							}
+							perror("lstat");
+							break;		//backup file as a precautionary measure	
+						}
+						printf("[%d]Successfuly retrieved the stats of file: %s\n", cpid, abs_prev_dest_file);
+
+
+						//if stats are unchanged, donot backup file
+						printf("Comparing stats..\n");
+						if((cur_file_stat.st_mode == prev_file_stat.st_mode)   && 
+						   (cur_file_stat.st_uid == prev_file_stat.st_uid)     &&
+						   (cur_file_stat.st_gid == prev_file_stat.st_gid)     &&
+						   (cur_file_stat.st_size == prev_file_stat.st_size)   && 
+					           (cur_file_stat.st_mtime == prev_file_stat.st_mtime) &&
+						   (cur_file_stat.st_ctime == prev_file_stat.st_ctime)
+						   )
+						{
+							do_backup_file = 0;
+							printf("File: %s is unchanged..Skipping its backup..\n", abs_src_file);
+							break;		
+						}
+						else
+						{
+							printf("File: %s is changed..It will be backed up..\n", abs_src_file);
+							break;
+						}
+						
+						
+						
+					}//end of else
+					
+				}//end of while
+
+			}//end of if 
+
+			////////////////////////////////
+			//Backup or not??
+			////////////////////////////////
+			if(do_backup_file)
+			{
+				printf("[%d]Backing up: %s..\n", cpid, abs_src_file);
+				if(-1 == backup_file(abs_src_file, abs_dest_file, &cur_file_stat))
+				{
+					printf("[%d]Failed to back up: %s..\n", cpid, abs_src_file);
+					free(abs_src_file);
+					free(abs_dest_file);
+					free(abs_prev_dest_file);	
+					printf("Continue to next directory entry..\n");
+					continue;
+				}
+				printf("Incrementing num files backed up counter..\n");
+				++num_files_backed;
+				printf("New val: %d\n", num_files_backed);
+				printf("[%d]Successfully, backed up: %s..\n", cpid, abs_src_file);
+			}	
+
+			//cleanup
+			free(abs_prev_dest_file);	
+		}//end of else(directory entry is a file)
+	
+		//cleanup
+		free(abs_src_file);
+		free(abs_dest_file);
+		
+	}	//end of while loop
+
+
+	closedir(src_dir);
+
+	return num_files_backed;
+}
+*/
+
+
+
+
+
+/*
+//perform recovery 
+//args:
+//	* abs. path of dir from which files are to be retreived
+//	* abs. path of dir where files are to be stored
+//
+//Note:
+//	|-abs. path passed in args must have "/" at the end.
+//	|-Eg: 	/dir/dir/srcdir/	<------------- correct format 
+//	|-	/dir/dir/srcdir		<------------- incorrect format
+//	|-dir's whose abs. path is passed to this function, must exist.
+//	|-This. func. won't create above mentioned dir's if they don't exist.
+//	
+//returns:
+//	0 :	recovery operation is successful
+//      -1:	recovery operation unsuccessful
+//
+int perform_recovery(char* abs_src, char* abs_dest)
+{
+	DIR* src_dir;
+	struct dirent* dent;	//directory entry
+	int cpid;
+	char* abs_src_file;	//absolute path of src. file
+	char* abs_dest_file;	//absolute path of dest. file
+	struct stat cur_file_stat;	//latest stats of file in src. dir.
+	int size;			//temp var to hold size of strings
+
+
+
+	cpid = getpid();
+
+	printf("[%d]Args received in perform_recovery()..\n", cpid);
+	printf("[%d]abs_src: %s..\n", cpid, abs_src);
+	printf("[%d]abs_dest: %s..\n", cpid, abs_dest);
+
+	/////////////////////
+	//open directories
+	//////////////////////////
+	printf("[%d]Opening directory: %s\n", cpid, abs_src);	
+	if((src_dir = opendir(abs_src)) == NULL)
+	{
+		if(errno == EACCES)
+		{
+			printf("[%d]Access denied to open: %s\n", cpid, abs_src);
+		}
+		perror("opendir");
+		return -1;
+	}
+	printf("[%d]Directory %s opened successfully..\n", cpid, abs_src);
+
+	
+
+	/////////////////////////////////////////////
+	//Perform operation on each directory entry
+	////////////////////////////////////////////	
+	while((dent = readdir(src_dir)) != NULL)
+	{
+		printf("[%d]File: %s Size: %d\n", cpid, dent->d_name, sizeof(dent->d_name));
+		///////////////////////////
+		//Ignore "." and ".."
+		//////////////////////////
+		if(dent->d_name[0] == '.' && dent->d_name[1] == '\0')
+		{
+			printf("[%d]\".\" encountered..Ignoring it..\n", cpid);
+			continue;
+		}	
+		if(dent->d_name[0] == '.' && dent->d_name[1] == '.' && dent->d_name[2] == '\0')
+		{
+			printf("[%d]\"..\" encountered..Ignoring it..\n", cpid);
+			continue;
+		}	
+
+		///////////////////////////////////////
+		//generate absolute path for filename
+		//////////////////////////////////////
+		printf("[%d]Generating Absolute path of src. file..\n", cpid);
+		//Assumption:
+		//	abs_src will of the form: /abc/def/
+		//	filename will be of the form:	xyz
+		//	We generate abs_src_file name as: /abc/def/xyz\0
+		//	But we allocate one byte extra(excluding '\0')
+		//	So that, we can append '/' at the end if cur. file is a dir
+		//	i.e. abs_src_file name becomes: /abc/def/xyz/\0
+		//	So, that during recursion, abs_src remains of the form /abc/def/xyz/
+		//
+		//Why used above aproach rather than directly appending "/" here itself at the end?
+		//
+		//Because:	format /abc/def/xyz/
+		//		specifies that xyz is also a dir (because only dir's contain a "/" at the end
+		//	
+		//		Now assume that xyz is a file
+		//		When we pass this path to stat() family fn's, they report an error regarding
+		//		one of the members of path /abc/def/xyz/ is not a dir..
+		//		which is true, since xyz is not a dir.
+		//		Hence, to handle this case, we pass only /abc/def/xyz to stat() family fn's
+		//		and append "/" at the end only if xyz is a directory
+		//	
+		if((abs_src_file = abs_path(1, abs_src, dent->d_name, NULL)) == NULL)
+		{
+			printf("[%d]Failed to generate Absolute path of src. file: %s", cpid, abs_src_file);
+			continue;
+		}
+		printf("[%d]Absolute path of src. file: %s", cpid, abs_src_file);
+
+
+		printf("[%d]Generating Absolute path of dest. file..\n", cpid);
+		//Assumption:
+		//	abs_dest will of the form: /abc/def/
+		//	filename will be of the form:	xyz
+		//	We generate abs_dest name as: /abc/def/xyz\0
+		//	But we allocate one byte extra(excluding '\0')
+		//	So that, we can append '/' at the end if cur. file is a dir
+		//	i.e. abs_dest_file name becomes: /abc/def/xyz/\0
+		//	So, that during recursion, abs_dest remains of the form /abc/def/xyz/
+		if((abs_dest_file = abs_path(1, abs_dest, dent->d_name, NULL)) == NULL)
+		{
+			printf("[%d]Failed to generate Absolute path of dest file: %s", cpid, abs_dest_file);
+			free(abs_src_file);
+			continue;
+			//return -1;
+		}
+		printf("[%d]Absolute path of Dest.file: %s\n", cpid, abs_dest_file);
+
+		//////////////////////////////////
+		//get stats of  cur. file
+		/////////////////////////////////
+		printf("[%d]Getting stats of file: %s\n", cpid, abs_src_file);
+		
+		if(-1 == lstat(abs_src_file, &cur_file_stat))
+		{
+			if(errno == EACCES)
+			{
+				printf("[%d]Skipping File: Permission denied to read to stats of the file: %s\n", cpid, abs_src_file);
+			}
+			perror("lstat");
+			free(abs_src_file);
+			free(abs_dest_file);
+			continue;
+		}
+		printf("[%d]Successfuly retrieved the stats of file: %s\n", cpid, abs_src_file);
+	
+		//////////////////////////////////
+		//If cur. file is a dir
+		/////////////////////////////////
+		if(S_ISDIR(cur_file_stat.st_mode))
+		{
+			printf("[%d] %s is a directory..\n", cpid, abs_src_file);	
+			printf("[%d] Making directory of this name in dest: %s..\n", cpid, abs_dest_file);
+			if(-1 == mkdir(abs_dest_file, 0744))
+			{
+				if(errno == EACCES)
+				{
+					printf("[%d]Skipping DIR: Permission denied to make dir in dest: %s\n", cpid, abs_dest_file);
+				}
+				perror("mkdir");
+				free(abs_src_file);
+				free(abs_dest_file);
+				continue;
+			}
+			printf("[%d] Successfully created directory of this name in dest: %s..\n", cpid, abs_dest_file);
+
+			printf("[%d] Moving inside: %s\n", cpid, abs_src_file);
+
+			size = strlen(abs_src_file);
+			printf("[%d] length of abs. src. file path: %d\n", cpid, size);
+			abs_src_file[size] = '/';
+			abs_src_file[size+1] = '\0';
+			printf("[%d] Updated abs. src. file path: %s\n", cpid, abs_src_file);
+			
+			size = strlen(abs_dest_file);
+			abs_dest_file[size] = '/';
+			abs_dest_file[size+1] = '\0';
+			printf("[%d] Updated abs. dest. file path: %s\n", cpid, abs_dest_file);
+
+			//printf("**********************\n");
+			if(-1 == perform_recovery(abs_src_file, abs_dest_file))
+			{
+				printf("Failed to recover: %s\n", abs_src_file);
+				free(abs_src_file);
+				free(abs_dest_file);
+				continue;
+			}
+
+			
+			printf("[%d] Moving out of: %s\n", cpid, abs_src_file);
+			
+			
+		}
+		//////////////////////////////////
+		//If cur. file is not a dir
+		/////////////////////////////////
+		else
+		{
+			printf("[%d] %s is a file..\n", cpid, abs_src_file);	
+
+			printf("[%d]recovering: %s..\n", cpid, abs_src_file);
+			if(-1 == backup_file(abs_src_file, abs_dest_file, &cur_file_stat))
+			{
+				printf("[%d]Failed to recover: %s..\n", cpid, abs_src_file);
+				free(abs_src_file);
+				free(abs_dest_file);
+				continue;
+			}
+			printf("[%d]Successfully, recovered : %s..\n", cpid, abs_src_file);
+		}
+	
+		free(abs_src_file);
+		free(abs_dest_file);
+		
+	}	//end of while loop
+
+
+	closedir(src_dir);
+
+	return 0;
+}
+*/
+
+//Perform backup operation by sending:
+//	* file stats
+//	* file content
+//	to remote daemon
+//args:
+//	* socket descriptor over which communication takes place with remote daemon
+//	* abs. path of dir from which files are to be retreived
+//	* abs. path of dir where files are to be stored
+//
+//Note:
+//	|-abs. path passed in args must have "/" at the end.
+//	|-Eg: 	/dir/dir/srcdir/	<------------- correct format 
+//	|-	/dir/dir/srcdir		<------------- incorrect format
+//	|-dir's whose abs. path is passed to this function, must exist.
+//	|-This. func. won't create above mentioned dir's if they don't exist.
+//	
+//returns:
+//	nothing
+//
+void send_backup_data(int sock, char* abs_src, char* abs_dest)
+{
+	DIR* src_dir		= NULL;
+	struct dirent* dent	= NULL;		//directory entry
+	int cpid		= 0;
+	int fd			= 0;		//file descriptor
+	int size		= 0;		//temp var to hold size of strings
+	int temp		= 0;
+	unsigned char* buf	= NULL;		//buffer used to read/write file contents
+	unsigned long nbytes	= 0;
+	char* abs_src_file	= {0};		//absolute path of src. file
+	char* abs_dest_file	= {0};		//absolute path of dest. file
+	struct stat* cur_file_stat 	= NULL;	//stats of file in src. dir.
+	struct backup_file_stat* bf_stat= NULL;	//file stats sent to remote daemon before backing up file
+	int error = 0;
+	char transfer_file_contents 	= 'y';	//flag to indicate whether contents of a file be transferred to remote daemon or not 
+
+
+
+	cpid = getpid();
+
+	//perform m/y allocation
+	buf 		= calloc(BUFSIZE, sizeof(unsigned char));
+	cur_file_stat 	= calloc(1, sizeof(struct stat));
+	bf_stat 	= calloc(1, sizeof(struct backup_file_stat));
+	if(NULL == buf || NULL == cur_file_stat || NULL == bf_stat)
+	{
+		printf("Not enough m/y..\n");
+		return;
+	}
+
+	printf("[%d]Args received in send_backup_data()..\n", cpid);
+	printf("[%d]sock: 	%d..\n", cpid, sock);
+	printf("[%d]abs_src: 	%s..\n", cpid, abs_src);
+	printf("[%d]abs_dest: 	%s..\n", cpid, abs_dest);
+
+	/////////////////////
+	//open directories
+	//////////////////////////
+	printf("[%d]Opening directory: %s\n", cpid, abs_src);	
+	if((src_dir = opendir(abs_src)) == NULL)
+	{
+		if(errno == EACCES)
+		{
+			printf("[%d]Access denied to open: %s\n", cpid, abs_src);
+		}
+		perror("opendir");
+		return;
+	}
+	printf("[%d]Directory %s opened successfully..\n", cpid, abs_src);
+
+	
+
+	/////////////////////////////////////////////
+	//Perform operation on each directory entry
+	////////////////////////////////////////////	
+	while((dent = readdir(src_dir)) != NULL)
+	{
+		printf("[%d]File: %s\n", cpid, dent->d_name);
+		///////////////////////////
+		//Ignore "." and ".."
+		//////////////////////////
+		if(dent->d_name[0] == '.' && dent->d_name[1] == '\0')
+		{
+			printf("[%d]\".\" encountered..Ignoring it..\n", cpid);
+			continue;
+		}	
+		if(dent->d_name[0] == '.' && dent->d_name[1] == '.' && dent->d_name[2] == '\0')
+		{
+			printf("[%d]\"..\" encountered..Ignoring it..\n", cpid);
+			continue;
+		}	
+
+		///////////////////////////////////////
+		//generate absolute path for filename
+		//////////////////////////////////////
+		printf("[%d]Generating Absolute path of src. file..\n", cpid);
+		//Assumption:
+		//	abs_src will of the form: /abc/def/
+		//	filename will be of the form:	xyz
+		//	We generate abs_src_file name as: /abc/def/xyz\0
+		//	But we allocate one byte extra(excluding '\0')
+		//	So that, we can append '/' at the end if cur. file is a dir
+		//	i.e. abs_src_file name becomes: /abc/def/xyz/\0
+		//	So, that during recursion, abs_src remains of the form /abc/def/xyz/
+		if((abs_src_file = abs_path(1, abs_src, dent->d_name, NULL)) == NULL)
+		{
+			printf("[%d]Failed to generate Absolute path of src. file: %s", cpid, abs_src_file);
+			continue;
+		}
+		printf("[%d]Absolute path of src. file: %s", cpid, abs_src_file);
+
+
+		printf("[%d]Generating Absolute path of dest. file..\n", cpid);
+		//Assumption:
+		//	abs_dest will of the form: /abc/def/
+		//	filename will be of the form:	xyz
+		//	We generate abs_dest name as: /abc/def/xyz\0
+		//	But we allocate one byte extra(excluding '\0')
+		//	So that, we can append '/' at the end if cur. file is a dir
+		//	i.e. abs_dest_file name becomes: /abc/def/xyz/\0
+		//	So, that during recursion, abs_dest remains of the form /abc/def/xyz/
+		if((abs_dest_file = abs_path(1, abs_dest, dent->d_name, NULL)) == NULL)
+		{
+			printf("[%d]Failed to generate Absolute path of dest file: %s", cpid, abs_dest_file);
+			free(abs_src_file);
+			continue;
+			//return -1;
+		}
+		printf("[%d]Absolute path of Dest.file: %s\n", cpid, abs_dest_file);
+
+
+
+		//////////////////////////////////
+		//get stats of  cur. file
+		/////////////////////////////////
+		printf("[%d]Getting stats of file: %s\n", cpid, abs_src_file);
+		
+		if(-1 == lstat(abs_src_file, cur_file_stat))
+		{
+			if(errno == EACCES)
+			{
+				printf("[%d]Skipping File: Permission denied to read to stats of the file: %s\n", cpid, abs_src_file);
+			}
+			perror("lstat");
+			free(abs_src_file);
+			free(abs_dest_file);
+			continue;
+		}
+		printf("[%d]Successfuly retrieved the stats of file: %s\n", cpid, abs_src_file);
+
+
+		/////////////////////////////////////
+		//fill the backup file stats struct
+		///////////////////////////////////// 
+		strcpy(bf_stat->abs_dest, abs_dest_file);
+		bf_stat->mode   = cur_file_stat->st_mode;
+		bf_stat->uid    = cur_file_stat->st_uid;
+		bf_stat->gid    = cur_file_stat->st_gid;
+		bf_stat->size   = cur_file_stat->st_size;
+		bf_stat->atime  = cur_file_stat->st_atime;
+		bf_stat->mtime  = cur_file_stat->st_mtime;
+
+		//Send backup file stats to Remote Daemon
+		printf("Sending backup file stats to remote Daemon..\n");
+		while(sizeof(struct backup_file_stat) != send(sock, bf_stat, sizeof(struct backup_file_stat), 0))
+		{
+			perror("send");
+			if(errno == EINTR)
+			{
+				continue;
+			}
+			printf("Failed to send backup file stats to remote Daemon..\n");
+			free(abs_src_file);
+			free(abs_dest_file);
+			error = 1;
+		}
+		if(error == 1)
+		{
+			error = 0;
+			continue;
+		}
+		printf("Successfully sent backup file stats to remote Daemon..\n");
+
+
+		/////////////////////////////////////////
+		//If cur. file is not a dir,
+		//Send its contents to the remote daemon
+		//based on the confirmation received from
+		//remote daemon
+		////////////////////////////////////////
+		if(!S_ISDIR(cur_file_stat->st_mode))
+		{
+			while(1 != recv(sock, &transfer_file_contents, sizeof(char), 0))
+			{
+				perror("recv");
+				if(errno == EINTR)
+				{
+					continue;
+				}
+				printf("Failed to receive file transfer confirmation from remote daemon..\n");
+				free(abs_src_file);
+				free(abs_dest_file);
+				error = 1;	//error file reading transfer confirmation
+			}
+			if(error == 1)
+			{
+				error = 0;
+				continue;	//skip file contents transfer
+			}
+			printf("File Contents Transfer Confirmation received from Remote Daemon: %c\n", transfer_file_contents);
+			if(transfer_file_contents != 'y')
+			{
+				//Send backup file content to Remote Daemon
+				printf("[%d] %s is a file..\n", cpid, abs_src_file);	
+				printf("Sending backup file content to remote Daemon..\n");
+
+				printf("Opening file: %s\n", abs_src_file);
+				if((fd = open(abs_src_file, O_RDONLY)) == -1)
+				{
+					printf("Failed to open file: %s..\n", abs_src_file);
+					free(abs_src_file);
+					free(abs_dest_file);
+					continue;
+				}
+				printf("File opened successfully,,\n");
+
+				nbytes = bf_stat->size;
+				while((nbytes > 0) && (temp = read(fd, buf, BUFSIZE)))	//read file contents
+				{
+					if(temp == -1)
+					{
+						perror("read");
+						if(errno == EINTR)
+						{
+							continue;
+						}
+						printf("Failed to read backup file contents..\n");
+						free(abs_src_file);
+						free(abs_dest_file);
+						error = 1;
+						break;
+					}
+					while(temp != send(sock, buf, temp, 0))	//send file contents to remote daemon
+					{
+						perror("send");
+						if(errno == EINTR)
+						{
+							continue;
+						}
+						printf("Failed to send backup file contents to remote Daemon..\n");
+						free(abs_src_file);
+						free(abs_dest_file);
+						error = 1;
+						break;
+					}
+					if(error == 1)	//error while sending data
+					{
+						break;
+					}
+					nbytes -= temp;
+				}
+				if(error == 1)	//error while reading data or sending data
+				{
+					error = 0;
+					continue;
+				}
+				printf("Successfully sent backup file stats to remote Daemon..\n");
+
+				close_descriptor(fd, 0);
+			}//end of file contents transfer
+
+		}
+		//////////////////////////////////
+		//If cur. file is a dir
+		/////////////////////////////////
+		else
+		{
+			printf("[%d] Moving inside: %s\n", cpid, abs_src_file);
+
+			size = strlen(abs_src_file);
+			printf("[%d] length of abs. src. file path: %d\n", cpid, size);
+			abs_src_file[size] = '/';
+			abs_src_file[size+1] = '\0';
+			printf("[%d] Updated abs. src. file path: %s\n", cpid, abs_src_file);
+			
+			size = strlen(abs_dest_file);
+			abs_dest_file[size] = '/';
+			abs_dest_file[size+1] = '\0';
+			printf("[%d] Updated abs. dest. file path: %s\n", cpid, abs_dest_file);
+
+			//Recursively try to backup the contents of directory
+			send_backup_data(sock, abs_src_file, abs_dest_file);
+
+		}//end of else(directory entry is a file)
+	
+		//cleanup
+		free(abs_src_file);
+		free(abs_dest_file);
+		
+	}//end of while loop
+
+	//cleanup
+	free(buf);
+	free(cur_file_stat);
+	free(bf_stat);
+	closedir(src_dir);
+}
+
+
+
+
+
+//take apt. action as per the generated signal
+//signal handling operations:
+//SIGALRM:
+//	perform backup when timer expires and SIGALRM is generated
+//
+//SIGUSR1:
+//	default backup interval changed, apply this modification on all scheduled as well as subsequent backup operations
+//Note:
+//	each child that is associated with a backup opeeation, is also associated with signal handler.
+//	Hence, each child responsible for performing backup receives these signals.
+//
+//returns:
+//	nothing
+void sighandler(int signo)
+{
+	int cpid 	= getpid();		//child process id
+	int i 		= 0;			//temp counter
+	int n		= 0;			//temp var.
+	int sock	= 0;			//socket descriptor
+	int fd		= 0;			//file descriptor
+	struct sockaddr_in r_daemon 	= {0};	//remote daemon socket configuration with which connection is to be established
+	char backup_op_ok 	  	= 'y';	//flag to indicate that backup operation has been given green flag by remote host or not
+	struct flock lock		= {0};	//lock/unlock file that keeps info about each backup operation performed
+	struct backup_file_stat bf_stat	= {0};	//to indicate end of data transfer
+
+	if(signo == SIGALRM)
+	{
+		printf("[%d]SIGALRM received..\n", cpid);
+
+		char new_dirname[TIMESTAMP_LEN];	//name of the dir. to be created	
+		char* abs_cur_dest;			//absolute path of directory where files will be backed during this backup
+
+		//create socket
+		printf("[Sender]Creating Socket..\n");
+		if((sock = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+		{
+			perror("socket");
+			return; 
+		}
+		printf("[Sender]Socket Created: %d..\n", sock);
+
+		//Configure Connection Details
+		printf("[Sender]Configuring Connnection Details..\n");
+		r_daemon.sin_family       =       AF_INET;
+		r_daemon.sin_port         =       htons(PORT_RH);	//Connect on port reserved for receiving backup_data
+		if(-1 == inet_pton(AF_INET, backup.b_op.dest_ip, &r_daemon.sin_addr))
+		{
+			perror("inet_pton");
+			printf("Closing Socket\n");
+			close_descriptor(sock, 0);
+			return;
+		}
+		printf("[Sender]Connnection Details Configured Successfully..\n");
+
+		//Connect With Daemon
+		printf("[Sender]Trying to Connect with Daemon..\n");
+		if(-1 == connect(sock, (struct sockaddr*) &r_daemon, sizeof(struct sockaddr_in)))
+		{
+			perror("connect");
+			printf("Closing Socket\n");
+			close_descriptor(sock, 0);
+		}
+		printf("[Sender]Connection Established with Daemon..\n");
+
+
+		//Send backup Details to Remote Daemon
+		printf("[Sender]Sending details of backup to remote Daemon..\n");
+		while(sizeof(backup.b_op) != send(sock, &backup.b_op, sizeof(backup.b_op), 0))
+		{
+			perror("send");
+			if(errno == EINTR)
+			{
+				continue;
+			}
+			printf("[Sender]Failed to send backup details to remote daemon..\n");
+			printf("[Sender]Closing Socket\n");
+			close_descriptor(sock, 0);
+		}
+		printf("[Sender]b_op struct sent successfully to remote Daemon..\n");
+
+
+		//Receive reply from Remote Dameon whether backup operation can be performed successfully or not!!
+		//e.g. 	* If dest doesnot exists on remote host, then, backup operation can't be performed
+		//	* Not enough m/y
+		//	* failing to create backup dir for this backup operation inside dest dir
+		while(1 != recv(sock, &backup_op_ok, sizeof(char), 0))
+		{
+			perror("recv");
+			if(errno == EINTR)
+			{
+				continue;
+			}
+			close_descriptor(sock, 0);
+			return;
+		}
+		printf("[Sender]Flag received from Remote Daemon: %c\n", backup_op_ok);
+		if(backup_op_ok != 'y')
+		{
+			printf("[Sender]FAILED to initiate backup operation..RED FLAG shown by the remote Daemon..\n");
+			close_descriptor(sock, 0);
+			return;
+		}
+
+		//Receive the name of dir created inside destination dir. where files backed up
+		//during current operation will be stored
+		while(TIMESTAMP_LEN != recv(sock, new_dirname, TIMESTAMP_LEN, 0))
+		{
+			perror("recv");
+			if(errno == EINTR)
+			{
+				continue;
+			}
+			close_descriptor(sock, 0);
+			return;
+		}
+		printf("[Sender]Backup dirname received from Remote Daemon: %s\n", new_dirname );
+
+
+		printf("[Sender]Generating absolute name of dest. (on remote host) for current backup..\n");
+		//b_op.dest path already is of the form "/fads/adsf/"
+		//Hence, we don't need to append "/" at the end explicitly
+		//but after appending new_dirname to it, we append "/" at its end
+		//and then, '\0' to terminate it
+		//Eg:
+		//	"/media/Device/Folder/Backup/" + "20161210121020" + "/" + "\0"
+		if((abs_cur_dest = abs_path(0, backup.b_op.dest, new_dirname, "/", NULL)) == NULL)
+		{
+			printf("[Sender]Failed to Generate absolute name of dest. for current backup: %s..\n", abs_cur_dest);
+			printf("[Sender]Skipping backup operation..\n");
+			close_descriptor(sock, 0);
+			return;
+		}
+		printf("[Sender]Generated absolute name of dest. for current backup: %s..\n", abs_cur_dest);
+
+
+		//Initiate Backup Operation
+		printf("[Sender]Calling send_backup_data() ..\n");
+		send_backup_data(sock, backup.b_op.src, abs_cur_dest);
+		printf("[Sender]send_backup_data() returned..\n");
+
+		//signal end of data transfer
+		printf("Sending Empty backup file stat struct to remote Daemon to indicate end of data transfer..\n");
+		memset(bf_stat.abs_dest, '\0', sizeof(bf_stat.abs_dest));
+		while(sizeof(struct backup_file_stat) != send(sock, &bf_stat, sizeof(struct backup_file_stat), 0))
+		{
+			perror("send");
+			if(errno == EINTR)
+			{
+				continue;
+			}
+			printf("Failed to send backup file stats to remote Daemon..\n");
+			free(abs_cur_dest);
+			close_descriptor(sock, 0);
+			return;
+		}
+		printf("Successfully sent empty backup file stat struct to remote Daemon..\n");
+
+
+		free(abs_cur_dest);
+		close_descriptor(sock, 0);
+
+
+		/////////////////////////////////
+		//update backup details struct
+		/////////////////////////////////
+		backup.b_op.b_ctr = (backup.b_op.b_ctr + 1) % NBACKUPS;	//reset backup counter after every 7th backup
+		strcpy(backup.b_op.last_bt[backup.b_op.b_ctr], new_dirname);					//update val. of last backup 
+/*
+		printf("[Sender]Received backup_op struct..\n");
+		printf("[Sender]b_op.src: 	%s\n", backup.b_op.src);
+		printf("[Sender]b_op.dest: 	%s\n", backup.b_op.dest);
+		printf("[Sender]b_op.nmin: 	%d\n", backup.b_op.nmin);
+		printf("[Sender]b_op.b_ctr: 	%d\n", backup.b_op.b_ctr);
+		printf("[Sender]b_op.hash:	%s\n", backup.b_op.hash);
+		printf("[Sender]b_op.dest_ip:	%s\n", backup.b_op.dest_ip);
+		for(i = 0; i < NBACKUPS; i++)
+		{
+			printf("[Sender]b_op.last_bt[%d]: %s\n", i, backup.b_op.last_bt[i]);
+		}
+		printf("[Sender]b_op.itimer.it_interval.tv_sec: 	%d\n", backup.b_op.itimer.it_interval.tv_sec);
+		printf("[Sender]b_op.itimer.it_interval.tv_usec: 	%d\n", backup.b_op.itimer.it_interval.tv_usec);
+		printf("[Sender]b_op.itimer.it_value.tv_sec: 		%d\n", backup.b_op.itimer.it_value.tv_sec);
+		printf("[Sender]b_op.itimer.it_value.tv_usec: 		%d\n", backup.b_op.itimer.it_value.tv_usec);
+*/
+
+		//////////////////////////////////
+		//store backup details in file
+		//////////////////////////////////
+		if((fd = open(BD_FILENAME, O_WRONLY | O_CREAT | O_APPEND, 0644)) == -1)
+		{
+			printf("[%d]Backup performed successfully but failed to maintain its record..\n", cpid);
+			perror("open");
+			return;
+		}
+		printf("[%d]File opened successfully..\n", cpid);
+
+		printf("[%d]Configuring lock..\n", cpid);
+		lock.l_type = F_WRLCK;
+		lock.l_whence = SEEK_SET;
+		lock.l_start = 0;
+		lock.l_len = 0;		//lock entire file
+		lock.l_pid = cpid;
+		printf("[%d]Lock configured..\n", cpid);
+
+		
+		printf("[%d]Trying to acquire lock on file..\n", cpid);		
+		if(-1 == fcntl(fd, F_SETLKW, &lock))
+		{
+			printf("[%d]Backup performed successfully but failed to maintain its record..\n", cpid);
+			perror("fcntl");
+			return;
+		}
+		printf("[%d]Lock acquired..\n", cpid);
+		
+		if(write(fd, &backup.b_op, sizeof(struct backup_op)) != sizeof(struct backup_op))
+		{
+			printf("[%d]Backup performed successfully but failed to maintain its record..\n", cpid);
+			perror("write");
+			return;
+		}
+		printf("[%d]Data(%d bytes) written successfully to file..\n", cpid, sizeof(struct backup_op));
+
+		lock.l_type = F_UNLCK;
+
+		printf("[%d]Releasing file lock..\n", cpid);		
+		if(-1 == fcntl(fd, F_SETLKW, &lock))
+		{
+			printf("[%d]Backup performed successfully and maintained its record but failed to unlock records file..\n", cpid);
+			perror("fcntl");
+			return;
+		}
+		printf("[%d]Lock released..\n", cpid);
+
+		if(-1 == close(fd))
+		{
+			printf("[%d]Backup performed successfully and maintained its record but failed to close records file..\n", cpid);
+			perror("close");
+			return;
+		}
+		printf("[%d]File closed..\n", cpid);
+
+	}	//end of SIGALRM handling 
+/*	else if(signo == SIGUSR1)
+	{
+		struct itimerval cur_itimer;	//temp. obj.
+		int shmid;			//shared mem id
+		void* shmptr;			//pointer to shared mem
+
+		printf("[%d]SIGUSR1 received..\n", cpid);
+
+		//If current child process uses default backup interval, then update its timer as per new interval
+		//(nmin = 0 means that a child process uses default val)
+		if(b_op.nmin == 0)
+		{
+			//get shared memory id
+			if((shmid = shmget(ftok(KEY_PATHNAME, KEY_PROJID), sizeof(int), IPC_CREAT | 0744)) == -1)
+			{
+				printf("[%d]Failed to allocate shared memory..\n", cpid);
+				printf("[%d]Skipping to change backup interval..\n", cpid);
+				perror("shmget");
+				return;
+			}
+			printf("[%d]Shared mem id: %d\n", cpid, shmid);
+
+			//attach shared mem to process address space
+			if((shmptr = shmat(shmid, (void*)0, 0)) == (void*)-1)
+			{
+				printf("[%d]Failed to attach shared memory..\n", cpid);
+				printf("[%d]Skipping to change backup interval..\n", cpid);
+				perror("shmat");
+				return;
+			}
+			printf("[%d]Shared mem attached at address: %p\n", cpid, shmptr);
+
+
+			//update timer val
+			//complete currently pending backup as per current timer values
+			//from next backup onwards, use new timer values
+			printf("[%d]Get current timer values..\n", cpid);
+			if(-1 == getitimer(ITIMER_REAL, &cur_itimer))
+			{
+				printf("[%d]Failed to get the value of interval timer..\n", cpid);
+				printf("[%d]Skipping to change backup interval..\n", cpid);
+				perror("getitimer");
+				return;
+			}
+
+			printf("[%d]Configuring new timer..\n", cpid);
+			b_op.itimer.it_interval.tv_sec = (*(int*)shmptr) * (60);	//read new timer val from shared mem and convert it into sec's
+			b_op.itimer.it_interval.tv_usec = 0;	
+			//suppose, pending sec's to backup as per prev timer is 4840
+			//and new interval is 60 sec's
+			//so we use both values to conclude a new val by which to perform the first backup as per new interval is done	
+			//We can't use new interval val directly, because then, all processes that backup as per dflt frequency
+			//will backup nearly at the same time
+			//Also, we can't use prev. timer's pending sec's value directly
+			//Because if that val is very large, then first backup since new timer will take long time
+			b_op.itimer.it_value.tv_sec = (cur_itimer.it_value.tv_sec % (*(int*)shmptr)) + 1;
+			b_op.itimer.it_value.tv_usec = 0;	
+
+			printf("[%d]Timer values configured..\n", cpid);
+			printf("[%d]b_op.itimer.it_interval.tv_sec: %d\n", cpid, b_op.itimer.it_interval.tv_sec);
+			printf("[%d]b_op.itimer.it_interval.tv_usec: %d\n", cpid, b_op.itimer.it_interval.tv_usec);
+			printf("[%d]b_op.itimer.it_value.tv_sec: %d\n", cpid, b_op.itimer.it_value.tv_sec);
+			printf("[%d]b_op.itimer.it_value.tv_usec: %d\n", cpid, b_op.itimer.it_value.tv_usec);
+
+			//set interval timer
+			if(-1 == setitimer(ITIMER_REAL, &b_op.itimer, NULL))
+			{
+				printf("[%d]Failed to set the value of interval timer..\n", cpid);
+				printf("[%d]Skipping to change backup interval..\n", cpid);
+				perror("setitimer");
+				return;
+			}
+			printf("[%d]Timer set..\n", cpid);
+
+			//de-attach shared mem from process address space
+			if((shmdt(shmptr))  == -1)
+			{
+				printf("[%d]Successfully changed backup interval timer but failed to detach shared mem...\n", cpid);
+				perror("shmdt");
+				return;
+			}
+			printf("[%d]Shared mem dettached from address: %p\n", cpid, shmptr);
+		}	//end of if
+				
+	}	//end of SIGUSR1 handling
+*/
+}
+
+
+
+
+
+
+//Add a new backup to be performed
+//args:
+//	arg_s   = struct containing new backup details
+//	sock_fd = socket fd w.r.t which new_backup() is to be performed (Each thread has its own socket fd for each connection)
+//returns:
+//	0 on success
+//	-1 on error
+int new_backup(struct arg* arg_s , int sock_fd)
+{
+/*
+	char* src;	//what to backup? (source path)
+	char* dest;	//where to backup? (dest path)
+	int nmin;	//After what interval to backup? (backup interval in minutes)
+			//		0 means use default backup interval
+			//		else 
+			//		use specified interval
+*/
+	int len;	//temp var. to store length of the string
+	int i;
+	pid_t pid;
+	int src_index;	//index val. of param_val field of arg struct where source path is stored 
+	int dest_index;	//index val. of param_val field of arg struct where dest path is stored 
+	struct backup_id* node;	//node that stores info about this new backup operation and
+				//to be entered into the list that main daemon uses to keep track of all backup operations currently underway
+
+
+	printf("new_backup()..\n");
+
+	//acquire mutex lock to synchronize access to backup_op struct
+	pthread_mutex_lock(&backup.mutex);
+	printf("Acquired mutex lock on: &backup.mutex\n");
+
+	////////////////////////////
+	//configure backup_op struct	
+	////////////////////////////
+
+	//$sanbackup -f nmin <src> <dest> [<ip>] (default val. of ip used if not supplied by user)	
+	if(arg_s->optns_type == 'f')
+	{
+		//configure backup interval (in min.)
+		backup.b_op.nmin 	= atoi(arg_s->parm_val[0]);
+		src_index 		= 1;
+		dest_index 		= 2;
+	}
+	else //$sanbackup <src> <dest> [<ip>] (default val. of ip used if not supplied by user)	
+	{
+		//configure backup interval (in min.)
+		backup.b_op.nmin 	= 0;	//nmin not supplied, use default val.
+		src_index 		= 0;
+		dest_index 		= 1;
+	}	
+
+	//configure the value of absolute src path
+	len = strlen(arg_s->parm_val[src_index]);
+	memset(backup.b_op.src, '\0', sizeof(backup.b_op.src));	
+	strcat(backup.b_op.src, arg_s->parm_val[src_index]);
+	if(backup.b_op.src[len-1] != '/')
+	{
+		strcat(backup.b_op.src, "/");
+	}
+	strcat(backup.b_op.src, "\0");
+	 
+	
+	//configure the value of absolute dest path
+	len = strlen(arg_s->parm_val[dest_index]);
+	memset(backup.b_op.dest, '\0', sizeof(backup.b_op.dest));	
+	strcat(backup.b_op.dest, arg_s->parm_val[dest_index]);
+	if(backup.b_op.dest[len-1] != '/')
+	{
+		strcat(backup.b_op.dest, "/");
+	}
+	strcat(backup.b_op.dest, "\0");
+
+	printf("src: %s\n", backup.b_op.src); 	
+	printf("dest: %s\n", backup.b_op.dest);
+
+	//configure the value of backup ctr (i.e. last backup that was performed)
+	backup.b_op.b_ctr	= -1;
+
+	//configure the value of backup timestamps (initially empty)
+	backup.b_op.b_ctr	= -1;
+	for(i = 0; i < NBACKUPS; i++)
+	{
+		memset(&backup.b_op.last_bt[i], '\0', TIMESTAMP_LEN);
+	}
+
+
+	//configure the interval timer based upon the val. of nmin	
+	if(backup.b_op.nmin == 0)							//use default timer, in case, no frequency interval is specified
+	{
+		pthread_mutex_lock(&dflt_backup_interval.mutex);
+		printf("Acquired mutex lock on: &dflt_backup_interval.mutex\n");
+		backup.b_op.itimer.it_interval.tv_sec = dflt_backup_interval.value * 60;	//convert default backup interval to sec's and store in timer
+		printf("Released mutex lock on: &dflt_backup_interval.mutex\n");
+		pthread_mutex_unlock(&dflt_backup_interval.mutex);
+	}
+	else
+	{
+		backup.b_op.itimer.it_interval.tv_sec 	= backup.b_op.nmin * 60;	//convert supplied backup interval to sec's and store in timer
+	}
+	backup.b_op.itimer.it_interval.tv_usec  = 0;	
+	backup.b_op.itimer.it_value.tv_sec 	= 1;				//perform first backup immediatly
+	backup.b_op.itimer.it_value.tv_usec 	= 0;
+
+	//configure the hash value
+	memset(backup.b_op.hash, '\0', HASH_LEN);	
+	strcat(backup.b_op.hash, arg_s->hash);
+
+	//configure the ip value
+	memset(backup.b_op.dest_ip, '\0', IP_LEN);	
+	strcat(backup.b_op.dest_ip, arg_s->dest_ip);
+
+	printf("backup_op configured..\n");
+
+	//////////////////////////////////////////////////////////////
+	//configure backup_id node to be entered into backup_id_list	
+	//////////////////////////////////////////////////////////////
+	printf("Configuring backup_id node..\n");
+	node = getnode(&backup_id_list.mutex);
+	strcpy(node->src    , backup.b_op.src);
+	strcpy(node->dest   , backup.b_op.dest);
+	strcpy(node->dest_ip, backup.b_op.dest_ip);
+
+	//if requested backup operation is already being performed then DISCARD it
+	if(NULL != search_backup_node(&backup_id_list.head, node, &backup_id_list.mutex))
+	{
+		printf("Requested backup operation already exists in the list..\n");
+		free(node);
+		printf("Backup Operation request DISCARDED..\n");
+		return -1;
+	}
+
+	/////////////////////////////////////////////////
+	//fork child to handle the new backup operation
+	////////////////////////////////////////////////
+	printf("Forking child to handle requested backup operation..\n");
+	if((pid = fork()) == -1)
+	{
+		printf("Failed to fork child process meant to handle new backup..\n");
+		perror("fork");
+		return -1;
+	}
+	if(pid == 0)
+	{
+		struct sigaction sigact;
+
+		pid = getpid();
+
+		//perform cleanup
+		close_descriptor(sock_fd_lh, 0);
+		close_descriptor(sock_fd_rh, 0);
+	
+
+		printf("[%d]Inside Child..\n", pid);
+
+		printf("[%d]backup_op struct..\n", pid);
+		printf("[%d]b_op.src: 	%s\n", pid, backup.b_op.src);
+		printf("[%d]b_op.dest: 	%s\n", pid, backup.b_op.dest);
+		printf("[%d]b_op.nmin: 	%d\n", pid, backup.b_op.nmin);
+		printf("[%d]b_op.b_ctr: %d\n", pid, backup.b_op.b_ctr);
+		printf("[%d]b_op.hash:	%s\n", pid, backup.b_op.hash);
+		printf("[%d]b_op.dest_ip:%s\n", pid, backup.b_op.dest_ip);
+		for(i = 0; i < NBACKUPS; i++)
+		{
+			printf("[%d]b_op.last_bt[%d]: %s\n", pid, i, backup.b_op.last_bt[i]);
+		}
+		printf("[%d]b_op.itimer.it_interval.tv_sec: 	%d\n", pid, backup.b_op.itimer.it_interval.tv_sec);
+		printf("[%d]b_op.itimer.it_interval.tv_usec: 	%d\n", pid, backup.b_op.itimer.it_interval.tv_usec);
+		printf("[%d]b_op.itimer.it_value.tv_sec: 	%d\n", pid, backup.b_op.itimer.it_value.tv_sec);
+		printf("[%d]b_op.itimer.it_value.tv_usec: 	%d\n", pid, backup.b_op.itimer.it_value.tv_usec);
+
+		//configure sigaction struct obj
+		printf("[%d]configuring sigaction struct obj..\n", pid);
+		sigact.sa_handler = sighandler;
+		sigact.sa_flags   = 0;
+
+		//register signals with sigaction
+		printf("[%d]registering signals with sigaction()..\n", pid);
+		if(-1 == sigaction(SIGALRM, &sigact, NULL))
+		{
+			printf("[%d]Failed to register handler for SIGALRM..Exiting this backup operation(%s to %s)\n", pid, backup.b_op.src, backup.b_op.dest);
+			perror("sigaction");
+			exit(1);		//exit child process
+		}
+		if(-1 == sigaction(SIGUSR1, &sigact, NULL))
+		{
+			printf("[%d]Failed to register handler for SIGUSR1..Exiting this backup operation(%s to %s)\n", pid, backup.b_op.src, backup.b_op.dest);
+			perror("sigaction");
+			exit(1);		//exit child process
+		}
+
+		//set interval timer for performing backup
+		printf("[%d]setting interval timer..\n", pid);
+		if(-1 == setitimer(ITIMER_REAL, &backup.b_op.itimer, NULL))	
+		{
+			printf("[%d]Failed to set timers...Exiting this backup operation(%s to %s)\n", pid, backup.b_op.src, backup.b_op.dest);
+			perror("setitimer");
+			exit(1);
+		}
+
+		while(1)
+		{
+			printf("\n[%d]waiting for signal..\n", pid);
+			pause();
+		}
+	}	//end of if block	
+	else
+	{
+		node->pid = pid;
+		printf("backup_id node configured..\n");
+
+		//////////////////////////////////////////
+		//Add backup_id node to backup_id_list
+		//////////////////////////////////////////
+		printf("Adding backup_id node to backup_id_list..\n");
+		if(-1 == insert_node(&backup_id_list.head, node, &backup_id_list.mutex))
+		{
+			printf("Failed to insert node into the backup_id_list..\n");
+		}
+		else
+		{
+			printf("Successfully inserted node into the backup_id_list..\n");
+		}
+
+		//Handle the case, when forked child exits and SIGCHLD is caught by daemon before the entry
+		//corresponding to that backup is added in the backup_id_list
+		//In this case, add entry into the list and then, check whether child has already not exited
+		//If so, try to remove entry from the list (entry will be removed if wasn't removed at the time when
+		//	SIGCHLD was caught)	
+		if(-1 == kill(pid, 0))
+		{
+			printf("child with pid: %d has already exited..\n", pid);
+			printf("Removing entry corresponding to this child from backup_id_list(if the entry exists)..\n");
+			if(-1 == delete_node(&backup_id_list.head, node, &backup_id_list.mutex))
+			{
+				printf("Entry doesnot exists in list..\n");
+			}
+			else
+			{
+				printf("Entry successfully deleted from the list..\n");
+			}
+		}
+
+		//unlock backup_op struct
+		printf("Released mutex lock on: &backup.mutex\n");
+		pthread_mutex_unlock(&backup.mutex);
+		return 0;
+	}
+}	
+
+
+
+
+
+
+
+
+
+
+
+/*
+
+//signal all children performing backup operations regarding new nmin value.
+//args:
+//	nmin:	new value of backup interval in minutes
+//returns:
+//	0  on success
+//	-1 on error
+int set_interval(int nmin)
+{
+	int i;			//counter
+	int shmid;		//shared mem id
+	void* shmptr;		//pointer to shared mem
+
+	printf("set_interval()\n");
+	dflt_backup_interval = nmin;
+	printf("New value of default backup interval: %d\n", dflt_backup_interval);
+
+
+	//create/get shared memory
+	if((shmid = shmget(ftok(KEY_PATHNAME, KEY_PROJID), sizeof(int), IPC_CREAT | 0744)) == -1)
+	{
+		printf("Failed to allocate shared memory..\n");
+		printf("Skipping to signal \"backing up childrens\" regarding changed backup interval..\n");
+		perror("shmget");
+		return -1;
+	}
+	printf("Shared mem id: %d\n", shmid);
+
+	//attach shared mem to process address space
+	if((shmptr = shmat(shmid, (void*)0, 0)) == (void*)-1)
+	{
+		printf("Failed to attach shared memory..\n");
+		printf("Skipping to signal \"backing up childrens\" regarding changed backup interval..\n");
+		perror("shmget");
+		return -1;
+	}
+	printf("Shared mem attached at address: %p\n", shmptr);
+
+	//write default backup interval time to the shared mem
+	*(int*)shmptr = nmin;
+	printf("Backup Interval val updated at shared mem..\n");
+	printf("New Backup Interval: %d min\n", *(int*)shmptr);
+
+	//notify all children that perform backup operation,
+	//regarding updated default time interval
+	printf("Signaling children regarding changed interval..\n");
+	for(i = 0; i <= child_ctr; i++)
+	{
+		kill(pid[i], SIGUSR1);
+	}
+	printf("Signals sent successfully..\n");
+
+	//de-attach shared mem from process address space
+	printf("De-attaching shared mem from process address space..\n");
+	if((shmdt(shmptr))  == -1)
+	{
+		printf("Successfully signaled \"backing up childrens\" regarding changed backup interval but failed to deattach shared mem..\n");
+		perror("shmdt");
+		return -1;
+	}
+	printf("Successfully De-attached shared mem from process address space..\n");
+
+	return 0;
+}
+*/
+
+
+
+
+
+
+/*
+
+//list all backups performed if timestamp is 0
+//	otherwise,
+//list all backed up files during specified timestamp
+//args:
+//	timestamp: if NULL, list all timestamps associated with each backup done so far.
+//		   else
+//		   list all files backed up during specified timestamp
+//returns:
+//	0 on success
+//	-1 otherwise
+int list(char* timestamp)
+{
+	int i;
+	int fd;
+	struct flock lock;
+	unsigned long len;
+	struct backup_op* bop_ptr;	//pointer to backup operation struct obj.
+	int n_elem;			//number of struct obj's in file
+	int status;			//operation status (listing is successful or not?)
+	char* buf;
+	int nbytes;
+
+	printf("list()\n");
+	printf("list details of timestamp: %s (0 means list all timestamps)\n", timestamp);
+
+	//read backup details from file and list requested info
+	if((fd = open(BD_FILENAME, O_RDONLY)) == -1)
+	{
+		printf("Failed to list backup details..\n");
+		perror("open");
+		return -1;
+	}
+	printf("File opened successfully..\n");
+
+	printf("Configuring lock..\n");
+	lock.l_type = F_RDLCK;
+	lock.l_whence = SEEK_SET;
+	lock.l_start = 0;
+	lock.l_len = 0;
+	lock.l_pid = getpid();
+	printf("Lock configured..\n");
+
+	
+	
+	printf("Trying to acquire lock on file..\n");		
+	if(-1 == fcntl(fd, F_SETLKW, &lock))
+	{
+		printf("Failed to list backup details..\n");
+		perror("fcntl");
+		close(fd);
+		return -1;
+	}
+	printf("Lock acquired..\n");
+
+	//find total length of file(in bytes);
+	//useful inf finding total records stored
+	if((len = lseek(fd, 0, SEEK_END)) == -1)
+	{
+		printf("Failed to seek the end of the file..\n");
+		perror("lseek");
+		close(fd);
+		return -1;
+	}
+	
+
+	printf("Mapping file to memory..\n");
+	if((bop_ptr = (struct backup_op*)mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0)) == (void*)-1)
+	{
+		printf("Failed to list backup details..\n");
+		perror("mmap");
+		close(fd);
+		return -1;
+	} 
+	printf("File(%lu bytes) mapped successfully to memory(%p)..\n", len, bop_ptr);
+
+
+	//list all the backups taken(timestamps only)
+	n_elem = len / sizeof(struct backup_op);
+
+	/////////////////////////////////////////////////
+	//perform listing operation
+	////////////////////////////////////////////////
+	if(timestamp == NULL)
+	{
+		buf = calloc(TIMESTAMP_LEN+1,  sizeof(char));
+
+		printf("Listing all timestamps..\n");
+		for(i = 0; i < n_elem; i++)
+		{
+			printf("%s\n", bop_ptr->last_bt[bop_ptr->b_ctr]);
+			nbytes = sprintf(buf, "%s\n", bop_ptr->last_bt[bop_ptr->b_ctr]);	//no need to memset buf again and again because len. of timestamp is fixed
+										//and only that many bytes will be overwrittern during next writing in buf
+			printf("buf: %s\n", buf);
+			printf("Writing to fifofd: %d\n", fifofd_wr);
+
+			if(nbytes != write(fifofd_wr, buf, nbytes))
+			{
+				printf("Failed to list backup details..\n");
+				perror("write");
+				close(fd);
+				free(buf);
+				munmap(bop_ptr, len);
+				return -1;
+			}	
+			printf("Wrote: %d bytes on fifofd(%d)\n", nbytes, fifofd_wr);
+
+
+
+
+			//printf("bop_ptr: %p\n", bop_ptr);
+			//printf("sizeof(struct backup_op): %d\n", sizeof(struct backup_op));
+			//IMP: typecast to char* so as that increment is by n bytes (rather than n * sizeof(struct backup))
+			//Eg: int* ptr = 0xf0	ptr+2 = 0xf8 rather than 0xf2	(POINTER ARITHMETIC)
+			//printf("bop_ptr + sizeof(struct backup_op): %p\n", (char*)bop_ptr + sizeof(struct backup_op));
+			bop_ptr = (struct backup_op*)((char*)bop_ptr + sizeof(struct backup_op));	
+			//printf("Next struct at: %p\n", bop_ptr);
+		}	
+
+		//write(fifofd_wr, "\0", 1);
+		close(fd);
+		free(buf);
+		munmap(bop_ptr, len);
+		printf("Listing performed successfully..\n");
+
+	}
+	else	//list all the files/dir backed up during specified timestamp
+	{
+
+		status = -1;
+		printf("Listing timestamp contents..\n");
+		status = 0;	//listing successful or not?
+		for(i = 0; i < n_elem; i++)
+		{
+			if(strcmp(bop_ptr->last_bt[bop_ptr->b_ctr], timestamp) == 0)
+			{
+				printf("Record with specified timestamp found..\n");	
+				printf("Forked child to list contents..\n");	
+				if(!fork())
+				{
+					int cpid = getpid();
+					printf("[%d] Changing cur. dir to %s ..\n", cpid, bop_ptr->dest);
+					if(-1 == chdir(bop_ptr->dest))
+					{
+						printf("[%d] Failed to list contents..\n", cpid);
+						printf("[%d] %s doesnot exists..\n", cpid, bop_ptr->dest);
+						perror("chdir");
+						close(fd);
+						munmap(bop_ptr, len);
+						return -1;
+					}
+					printf("[%d] Changing cur. dir to %s ..\n", cpid, bop_ptr->last_bt[bop_ptr->b_ctr]);
+					if(-1 == chdir(bop_ptr->last_bt[bop_ptr->b_ctr]))	//inside dest dir, change dir to specified timestamp
+					{
+						printf("[%d] Failed to list contents..\n", cpid);
+						printf("[%d] %s doesnot exists..\n", cpid, bop_ptr->last_bt[bop_ptr->b_ctr]);
+						perror("chdir");
+						close(fd);
+						munmap(bop_ptr, len);
+						return -1;
+					}
+					
+					printf("[%d] connecting stdout to fifo ..\n", cpid);
+					if(-1 == dup2(fifofd_wr, 1))	//duplicate stdout so that it is connected to fifo rather that standard output(terminal)
+					{
+						printf("[%d] Failed to list contents..\n", cpid);
+						perror("dup2");
+						close(fd);
+						munmap(bop_ptr, len);
+						return -1;
+
+					}
+					printf("[%d] exec() called..\n", cpid);
+					if(-1 == execlp("find", "find", NULL))
+					{
+						printf("[%d] Failed to list contents..\n", cpid);
+						perror("execlp");
+						close(fd);
+						munmap(bop_ptr, len);
+						return -1;
+					}
+					printf("[%d] exiting..\n", cpid);
+					exit(0);
+				}
+				break;
+			}	//end of if
+			bop_ptr = (struct backup_op*)((char*)bop_ptr + sizeof(struct backup_op));	
+		}	//end of for loop
+		printf("Waiting for child to exit..\n");
+		wait(&status);
+		if(WIFEXITED(status))
+		{
+			if(WEXITSTATUS(status) == 0)
+			{
+				printf("Listing performed successfully..\n");
+			}
+			else
+			{
+				printf("Listing performed unsuccessfully..\n");
+			}
+		}
+		else
+		{
+			printf("Listing performed unsuccessfully..\n");
+		}
+	}	//end of else
+
+
+	//////////////////////////////////////////////////
+	//signal util regarding end of data transfer
+	//////////////////////////////////////////////////
+	printf("signal backup util regarding end of data transfer..\n");
+	if(1 != write(fifofd_wr, "\0", 1))
+	{
+		printf("Failed to signal backup util regarding end of data transfer..\n");
+		perror("write");
+		close(fd);
+		munmap(bop_ptr, len);
+		return -1;
+	}
+	printf("end of data transfer..\n");
+
+	//////////////////////////////////////////
+	//Release file lock
+	/////////////////////////////////////////
+	printf("Releasing file lock..\n");		
+	lock.l_type = F_UNLCK;
+	if(-1 == fcntl(fd, F_SETLKW, &lock))
+	{
+		printf("Failed to unlock records file..\n");
+		perror("fcntl");
+		close(fd);
+		munmap(bop_ptr, len);
+		return -1;
+	}
+	printf("Lock released..\n");
+
+	if(-1 == munmap(bop_ptr, len))
+	{
+		printf("Failed to munmap file..\n");
+		perror("close");
+		close(fd);
+		return -1;
+	}
+	printf("File unmapped successfully..\n");
+
+	if(-1 == close(fd))
+	{
+		printf("Failed to close records file..\n");
+		perror("close");
+		return -1;
+	}
+	printf("File closed successfully..\n");
+
+	return 0;
+}
+*/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+
+//recover file/dir named ford(file or dir)
+//and store in a new directory named newdir
+//	* from lastbackup if no timestamp is specified (timestamp = 0)
+//		otherwise
+//	* from backup of specified timestamp
+//args:
+//	src:		name of a file or dir. to be recovered
+//			or
+//			"*" to specify full recovery
+//	
+//	dest:		complete path of directory where recovered data is to be placed
+//
+//	timestamp:	from where to retrieve data to be recovered?
+//			NULL means from last backup
+//			otherwise
+//			from dir. with specified timestamp as name
+//
+//NOTE:
+//	|- path supplied as recovery dest. must be an absolute path and all dir's except the last one (which is optional) must exist.
+//	|- EG:
+//		$./sanbackup -r "*" /home/bhojas/MyRecovery/Songs 20160204120506
+//				   \----------------------/
+//					      |
+//					      |
+//				This path must exist.	   \-----/
+//							      |
+//							      |
+//							Will be created if doesnot exists already
+//								
+//return:
+//	-1 on error
+//	 0 for success
+int recover(char* src, char* dest, char* timestamp)
+{
+	int fd;		//fd of file containing records of backups performed
+	int len;	//temp var. to store len
+	int total_records;	//total nummber of backups done by daemon
+	struct backup_op *bop = NULL;	//pointer to backup record w.r.t which recovery has to be done
+	char* abs_backup_dir = NULL;	//absolute path of backup dir from which recovery is to be done  
+	char* abs_src = NULL;		//absolute path of src (present somewhere inside abs_backup_dir if src(passed as arg) is valid)
+	char* abs_dest = NULL;		//absolute path inside dest(passed as arg) where contents recovered from abs_src are stored 
+	struct stat buf;	//buffer to store stats of a file
+	int i = 0;
+	int found = 0;
+
+	printf("recover()\n");
+	printf("recover %s and place it in %s from backup %s (0 means last backup)\n", src, dest, timestamp);
+
+
+	//configure dest. properly
+	len =  strlen(dest);
+	if(dest[len-1] != '/');
+	{
+		dest[len] = '/';
+		dest[len+1]   = '\0';
+	}
+
+	printf("recover %s and place it in %s from backup %s (0 means last backup)\n", src, dest, timestamp);
+
+
+
+	/////////////////////////////////////////////////////////////////////////////////
+	//find the location containing folder from which src file/dir is to be recovered
+	////////////////////////////////////////////////////////////////////////////////
+	printf("Opening records file..\n");
+	if((fd = open(BD_FILENAME, O_RDONLY)) == -1)
+	{
+		printf("Failed to open file containing backup records..\n");
+		perror("open");
+		return -1;
+	}
+	printf("Records file opened successfully..\n");
+
+	printf("Finding len of file..\n");
+	if((len = lseek(fd, 0, SEEK_END)) == (off_t)-1)
+	{
+		printf("Failed to find the length file containing backup records..\n");
+		perror("open");
+		close(fd);
+		return -1;
+	}
+	printf("Len. of file: %d\n", len);
+
+	if(len == 0)
+	{
+		printf("No backup records found..\n");
+		printf("Aborting recovery..\n");
+		close(fd);
+		return -1;
+	}
+	printf("Finding total records stored in file..\n");
+	total_records = len/sizeof(struct backup_op);
+	printf("Total records: %d\n", total_records);
+
+
+	printf("Mapping file to memory..\n");
+	if((bop = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0)) == (void*)-1)
+	{
+		printf("mmap() failed..\n");
+		perror("mmap");
+		close(fd);
+		return -1;
+	}
+	printf("Mapping of file to memory done..\n");
+
+
+	/////////////////////////////
+	//generate abs. path of backup dir where src. is residing
+	//
+	//Imp:	don't append src. name to the path, simply generate full path of the dir containing the src.
+	//
+	//Format:	/backup_dest/ + backup_timestamp + / + \0
+	//		/backup_dest/20161230121210/\0
+	/////////////////////////////
+	if(timestamp == NULL)
+	{
+		printf("timestamp is null..looking for details of last backup..\n");
+		//printf("bop: %p\n", bop);
+		//printf("sizeof struct backup_op: %d\n", sizeof(struct backup_op));
+		//printf("bop: %p\n", bop + 1);
+		//	
+		bop = bop + total_records - 1;
+		//printf("Last record starts from: %p\n", bop) ;
+
+		printf("Dest of last backup: %s\n", bop->dest);
+		printf("Timestamp of last backup: %s\n", bop->last_bt[bop->b_ctr]);
+
+		if(((abs_backup_dir = abs_path(0, bop->dest, bop->last_bt[bop->b_ctr], "/", NULL))) == NULL)
+		{
+			printf("Failed to generate Absolute path of backup dir containing our src to be recovered: %s\n", abs_backup_dir);
+			close(fd);
+			munmap(bop, len);
+			return -1;
+		}
+		printf("Absolute path of backup dir containing our src to be recovered: %s len: %d\n", abs_backup_dir, strlen(abs_src));
+	
+	}
+	else
+	{
+		printf("timestamp is %s..looking for details of backup with specified timestamp..\n", timestamp);
+		for(i = 0; i < total_records; i++)
+		{
+			if(0 == strcmp(bop->last_bt[bop->b_ctr], timestamp))
+			{
+				printf("Backup with specified timestamp found..\n");
+				found = 1;
+
+				printf("Dest of last backup: %s\n", bop->dest);
+				printf("Timestamp of last backup: %s\n", bop->last_bt[bop->b_ctr]);
+
+				if(((abs_backup_dir = abs_path(0, bop->dest, bop->last_bt[bop->b_ctr], "/", NULL))) == NULL)
+				{
+					printf("Failed to generate Absolute path of backup dir containing our src to be recovered: %s\n", abs_backup_dir);
+					close(fd);
+					munmap(bop, len);
+					return -1;
+				}
+				printf("Absolute path of dir. containing our src to be recovered: %s len: %d\n", abs_backup_dir, strlen(abs_backup_dir));
+
+				break;
+
+			}
+			++bop;		//move to next record	
+			free(abs_backup_dir);
+		}
+
+		if(!found)
+		{
+			printf("Invalid timestamp..\n");
+			close(fd);
+			munmap(bop, len);
+			return -1;
+		}
+	}
+
+
+	////////////////////////////////
+	//perform recovery
+	///////////////////////////////
+	if(0 == strcmp("*", src))
+	{
+		printf("Full recovery selected..\n");
+
+		//recover dir
+		if(-1 == perform_recovery(abs_backup_dir, dest))
+		{
+			printf("Failed to recover: %s\n", abs_backup_dir);
+			free(abs_backup_dir);
+			close(fd);
+			munmap(bop, len);
+			return -1;
+		}
+		else
+		{
+			printf("Successfully recovered: %s\n", abs_backup_dir);
+		}	
+
+
+		free(abs_backup_dir);
+		close(fd);
+		munmap(bop, len);
+
+	}	//end of full recovery operation
+	else
+	{
+
+		printf("Partial recovery selected..\n");
+
+		//check whether file/dir to be recovered exists or not
+		if(((abs_src = find(src, abs_backup_dir))) == NULL)
+		{
+			printf("%s not found in %s\n", src, abs_backup_dir);
+			free(abs_backup_dir);
+			close(fd);
+			munmap(bop, len);
+			return -1;
+		}	
+		printf("%s found in %s at: %s\n", src, abs_backup_dir, abs_src);
+
+
+		//create dest directory
+		if(-1 == make_dir(dest, DIRMODE_0755, 1))
+		{
+			printf("Failed to create new directory: %s\n", dest);
+			perror("mkdir");
+			free(abs_backup_dir);
+			free(abs_src);
+			close(fd);
+			munmap(bop, len);
+			return -1;
+		}
+
+	
+
+		///////////////////////////////////////////////////////
+		//get stats of file and perform corresponding actions
+		//////////////////////////////////////////////////////
+		printf("Getting stats of file: %s\n", abs_src);
+		if(-1 == lstat(abs_src, &buf))
+		{
+			printf("Failed to fetch stats of: %s\n", abs_src);
+			perror("lstat");
+			free(abs_backup_dir);
+			free(abs_src);
+			close(fd);
+			munmap(bop, len);
+			return -1;
+		}
+		printf("stats retreived successfully..");
+
+		if(S_ISDIR(buf.st_mode))
+		{
+			printf("%s is a directory..\n", abs_src);
+
+			//generate absolute path of dir. inside dest.(by appending name of file/dir to the passed dest path)
+			//where recovered contents are to be saved
+			//Eg: if dest is: 
+			//		/dir/dir
+			//    and folder to be recovered is src
+			//then absolute path of the folder where data is to be recovered is:
+			//		/dir/dir/src/
+			// i.e. search folder named "src" in specified timestamp and place its contents in:
+			//		/dir/dir/src/
+			len = strlen(dest);
+			if(dest[len-1] == '/')
+			{
+				printf("\"/\" already appended at the end of dest..\n");	
+				//Format:
+				//	/dest/ + src + / + \0
+				if((abs_dest = abs_path(0, dest, src, "/", NULL)) == NULL)
+				{
+					printf("Failed to generate Absolute path of dest %s\n", abs_dest);
+					free(abs_backup_dir);
+					free(abs_src);
+					close(fd);
+					munmap(bop, len);
+					return -1;
+				}
+			}
+			else
+			{
+				printf("\"/\" not already appended at the end of dest..\n");	
+				//Format:
+				//	/dest + / + src + / + \0
+				if((abs_dest = abs_path(0, dest, "/", src, "/", NULL)) == NULL)
+				{
+					printf("Failed to generate Absolute path of dest %s\n", abs_dest);
+					free(abs_backup_dir);
+					free(abs_src);
+					close(fd);
+					munmap(bop, len);
+					return -1;
+				}
+			}
+			printf("Absolute path of dest: %s\n", abs_dest);
+
+			//since, data to be recovered is a folder, we need to create folder of same name inside dest.
+			//(because, perform_recovery() assumes that supplied paths already exists)
+			//supplied by user.
+			//Eg:
+			//	$sanbackup -r dir ~/Desktop/myrecovery 20161210081220
+			//
+			//	/abc/20161210081220		~/Desktop/myrecovery	
+			//		|-dir
+			//	since, we need to recover "dir", hence we need to create dir of same name in recovery dest.
+			//
+			//				~/Desktop/myrecovery
+			//					|-dir
+			printf("Trying to create dir.: %s\n", abs_dest);
+			if(-1 == make_dir(abs_dest, DIRMODE_0755, 1))
+			{
+				free(abs_backup_dir);
+				free(abs_src);
+				free(abs_dest);
+				close(fd);
+				munmap(bop, len);
+				return -1;
+			}		
+			printf("Successfully created dir.: %s\n", abs_dest);
+
+			//recover dir
+			if(-1 == perform_recovery(abs_src, abs_dest))
+			{
+				printf("Failed to recover: %s\n", abs_src);
+				free(abs_backup_dir);
+				free(abs_src);
+				free(abs_dest);
+				close(fd);
+				munmap(bop, len);
+				return -1;
+			}
+			else
+			{
+				printf("Successfully recovered: %s\n", abs_src);
+			}	
+			
+		}
+		else
+		{
+			printf("%s is a file..\n", abs_src);
+
+			//generate absolute path of dest. where file is to be saved
+			len = strlen(dest);
+			if(dest[len-1] == '/')
+			{
+				printf("\"/\" already appended at the end of dest..\n");	
+				//Format:
+				//	/dest/ + src + \0
+				if((abs_dest = abs_path(0, dest, src, NULL)) == NULL)
+				{
+					printf("Failed to generate Absolute path of dest %s\n", abs_dest);
+					return -1;
+				}
+			}
+			else
+			{
+				printf("\"/\" not already appended at the end of dest..\n");	
+				//Format:
+				//	/dest + / + src + \0
+				if((abs_dest = abs_path(0, dest, "/", src, NULL)) == NULL)
+				{
+					printf("Failed to generate Absolute path of dest %s\n", abs_dest);
+					return -1;
+				}
+			}
+			printf("Absolute path of dest: %s\n", abs_dest);
+
+			//backup file
+			if(-1 == backup_file(abs_src, abs_dest, &buf))
+			{
+				printf("Failed to recover file: %s\n", abs_src);
+				free(abs_backup_dir);
+				free(abs_src);
+				free(abs_dest);
+				close(fd);
+				munmap(bop, len);
+				return -1;
+			}
+			printf("Successfuly recovered file: %s at: %s\n", abs_src, abs_dest);	
+		}	//end of else
+	
+		free(abs_backup_dir);
+		free(abs_src);
+		free(abs_dest);
+		close(fd);
+		munmap(bop, len);
+	
+	}	//end of partial recovery
+
+	
+	return 0;
+}
+*/
+
+
+//parse the received struct to find out which operation is
+//to be performed and accordingly process that operation
+//
+//args:
+//	struct arg *arg_s :  specifies operation to be performed
+//	sock_fd		  :  socket w.r.t which arg_s operation must be performed (Each thread will have its own sock_fd) 
+//returns:
+//	0 if parsing is successful (we don't care whether selected operation was performed successfully or not)
+//	-1 otherwise
+int parse_args(struct arg* arg_s, int sock_fd)
+{
+	printf("parsing arguements..\n");
+
+
+	if(arg_s == NULL)
+	{
+		printf("Invalid arguement supplied for parsing..\n");
+		return -1;
+	}
+
+	//$./sanbackup <src> <dest>	(in this case default ip used)
+	//	or
+	//$./sanbackup <src> <dest> <ip> (in this case ip supplied by user is used)
+	if((arg_s->optns_en == 0) && (arg_s->parm_c == 2))
+	{
+		printf("Option selected: sanbackup <src> <dest>..\n");
+		printf("or\n");
+		printf("Option selected: sanbackup <src> <dest> <ip>..\n");
+		if(-1 == new_backup(arg_s, sock_fd))
+		{
+			printf("Failed to configure new backup..\n");
+		}
+		else
+		{
+			printf("Successfully configured new backup..\n");
+		}
+
+	}
+	//$./sanbackup -f nmin <src> <dest>	(in this case default ip is used)
+	//	or
+	//$./sanbackup -f nmin <src> <dest> <ip> (in this case ip supplied by the user is used)
+	else if((arg_s->optns_type == 'f') && (arg_s->parm_c == 3) && (0 != strcmp(arg_s->dest_ip, "")))
+	{
+		printf("Option selected: sanbackup -f nmin <src> <dest>..\n");
+		printf("or\n");
+		printf("Option selected: sanbackup -f nmin <src> <dest> <ip>..\n");
+		if(-1 == new_backup(arg_s, sock_fd))
+		{
+			printf("Failed to configure new backup..\n");
+		}
+		else
+		{
+			printf("Successfully configured new backup..\n");
+			printf("Bytes written to socket: %d\n", write(sock_fd, "Successfully configured new backup..\n", 38));
+		}
+	}
+/*	else if((arg_s->optns_type == 'f') && (arg_s->parm_c == 1))
+	{
+		printf("Option selected: sanbackup -f nmin..\n");
+		int nmin = atoi(arg_s->parm_val[0]);
+		if(-1 == set_interval(nmin))
+		{
+			printf("Failed to signal \"backing up children\" regarding new interval..\n");
+		}
+		else
+		{
+			printf("Successfully signaled \"backing up children\" regarding new interval..\n");
+		}
+	}
+	else if((arg_s->optns_type == 'l') && (arg_s->parm_c == 0))
+	{
+		printf("Option selected: sanbackup -l..\n");
+		if(-1 == list(0))
+		{
+			printf("Problem occured while performing listing operation..\n");
+		}
+		else
+		{
+			printf("End of listing operation..\n");
+		}
+	}
+	else if((arg_s->optns_type == 'l') && (arg_s->parm_c == 1))
+	{
+		printf("Option selected: sanbackup -l <timestamp>..\n");
+		if(-1 == list(arg_s->parm_val[0]))
+		{
+			printf("Problem occured while performing listing operation..\n");
+		}
+		else
+		{
+			printf("End of listing operation..\n");
+		}
+	}
+	else if((arg_s->optns_type == 'r') && (arg_s->parm_c == 2))
+	{
+		printf("Option selected: sanbackup -r <file/dir> <newdir>..\n");
+		if(-1 == recover(arg_s->parm_val[0], arg_s->parm_val[1], 0))
+		{
+			printf("Problem occured while performing recovery operation..\n");
+		}
+		else
+		{
+			printf("End of recovery operation..\n");
+		}
+	}
+	else if((arg_s->optns_type == 'r') && (arg_s->parm_c == 3))
+	{
+		printf("Option selected: sanbackup -r <file/dir> <newdir> <timestamp>..\n");
+		if(-1 == recover(arg_s->parm_val[0], arg_s->parm_val[1], arg_s->parm_val[2]))
+		{
+			printf("Problem occured while performing recovery operation..\n");
+		}
+		else
+		{
+			printf("End of recovery operation..\n");
+		}
+	}
+	else
+	{
+		printf("Failed to parse arguements..\n");
+		return -1;
+	}
+*/
+	return 0;
+}
+
+
+
+//Receive Backup Data from Another Daemon and Process it
+void* recv_backup_data(void* arg)
+{
+	int sock_fd 			= 0;
+	struct backup_op temp_bop 	= {0};		//struct to store/modify backup related info
+	char backup_op_ok 		= 'y';		//flag to indicate whether the requested backup operation can be performed successfully or not
+	char* backup_dirname		= NULL;		//timestamp based dirname in which files were
+	char transfer_file_contents 	= 'y';		//flag to indicate whether contents of a file be transferred to remote daemon or not 
+	struct backup_file_stat bf_stat = {0};		//backup file stats 
+	char buf[BUFSIZE]		= {0};		//buffer used for reading/writing file contents
+	int nbytes			= 0;
+	int temp			= 0;
+	int error			= 0;
+	int fd;
+
+	printf("[RECIVER]Inside recv_backup_data()..\n");
+	sock_fd = *((int*)arg);
+	free(arg);
+
+	//Receive Details of the backup operation to be performed
+	printf("[RECIVER]Receiving details of backup from remote Daemon..\n");
+	while(sizeof(temp_bop) != recv(sock_fd, &temp_bop, sizeof(temp_bop), 0))
+	{
+		perror("recv");
+		if(errno == EINTR)
+		{
+			continue;
+		}
+		printf("[RECIVER]Failed to recv backup details from remote daemon..\n");
+		close_descriptor(sock_fd, 0);
+	}
+
+	//Check Whether Requested backup operation can be performed or not
+	//e.g. 	* If dest doesnot exists on remote host, then, backup operation can't be performed
+	//	* failed to allocate reqd. memory
+	//	* failed to generate timestamp based dir name or failed to create it
+	backup_dirname = (char*)malloc(sizeof(char) * TIMESTAMP_LEN);
+	if(backup_dirname == NULL)
+	{
+		printf("Failed to allocate m/y..\n");
+		backup_op_ok = 'n';
+	}
+
+
+	if(-1 == chdir(temp_bop.dest))
+	{
+		printf("Dest. dir. doesnot exists\n");
+		backup_op_ok = 'n';
+	}	
+
+	//Generate name of dir. where backed up data will be stored
+	//If dir name already exists, get new name for directory and 
+	//try again
+	//In case of other errors, exit
+	while(1)
+	{
+		get_new_dirname(backup_dirname);			//obtain new name for directory to be created
+		printf("New dir name is: %s\n", backup_dirname);
+
+		if(-1 == mkdir(backup_dirname, DIRMODE_0755))		//make new dir. in dest dir
+		{
+			if(errno == EEXIST)
+			{
+				printf("Dir already exists..\n");
+				printf("Getting another name..\n");
+			}
+			else
+			{
+				printf("Failed to make directory: %s\n", backup_dirname);
+				backup_op_ok = 'n';
+			}
+		}
+		else
+		{
+			break;			//directory created successfully
+		}
+	}
+
+	//Send reply from Remote Dameon whether backup operation can be performed successfully or not!!
+	while(1 != send(sock_fd, &backup_op_ok, sizeof(char), 0))
+	{
+		perror("recv");
+		{
+			continue;
+		}
+		close_descriptor(sock_fd, 0);
+		free(backup_dirname);
+		return NULL;
+	}
+	//If can't perform backup operation successfully, exit
+	//else, carry on
+	if('n' == backup_op_ok)
+	{
+		close_descriptor(sock_fd, 0);
+		free(backup_dirname);
+		return NULL;
+	}
+
+
+	//Send backup dirname from Remote Dameon
+	while(TIMESTAMP_LEN != send(sock_fd, backup_dirname, TIMESTAMP_LEN, 0))
+	{
+		perror("send");
+		if(errno == EINTR)
+		{
+			continue;
+		}
+		close_descriptor(sock_fd, 0);
+		free(backup_dirname);
+		return NULL;
+	}
+
+	//Main Backup Operation
+	//End of transfer is signalled by sending an empty backup file struct
+	while(1)
+	{
+		//recieve backup file stats
+		while(sizeof(struct backup_file_stat) != recv(sock_fd, &bf_stat, sizeof(struct backup_file_stat), 0))
+		{
+			perror("recv");
+			if(errno == EINTR)
+			{
+				continue;
+			}
+			printf("Failed to receive backup file stats..\n");
+			error = 1;	//failed to read backup file stats
+		}
+		if(error == 1)
+		{
+			error = 0;
+			continue;
+		}
+		printf("Backup file stats received successfully (abs_dest: %s)\n", bf_stat.abs_dest);
+
+		//Check whether end of transfer has been reached
+		if(0 == strcmp(bf_stat.abs_dest, ""))
+		{
+			printf("Empty file stat received which indicates end of transfer operation..\n");
+			break;
+		}
+
+		//If file is a dir, create it and
+		//preserve its timestamps and ownership
+		if(S_ISDIR(bf_stat.mode))
+		{
+			printf("%s: Is a dir)\n", bf_stat.abs_dest);
+			if(-1 == make_dir(bf_stat.abs_dest, bf_stat.mode, 1))
+			{
+				printf("Failed to create dir: %s\n", bf_stat.abs_dest);
+				continue;
+			}
+			printf("Successfully created dir: %s\n", bf_stat.abs_dest);
+			//Ownership should be preserved first and timestamps at the last, otherwise modification time of file will be set to the time
+			//when file's ownership is preserved
+			preserve_ownership(bf_stat.abs_dest, &bf_stat.uid, &bf_stat.gid);
+			preserve_timestamps(bf_stat.abs_dest, &bf_stat.atime, &bf_stat.mtime);
+
+		}
+		else
+		{
+			//Check whether there is need for the transfer of current file's contents for backup
+
+			//send confirmation whether file contents should be sent to remote daemon or not
+			while(1 != send(sock, &transfer_file_contents, sizeof(char), 0))
+			{
+				perror("send");
+				if(errno == EINTR)
+				{
+					continue;
+				}
+				printf("Failed to send file transfer confirmation from remote daemon..\n");
+				error = 1;	//error file reading transfer confirmation
+			}
+			if(error == 1)
+			{
+				error = 0;
+				continue;	//skip file contents transfer
+			}
+			if(transfer_file_contents != 'y')
+			{
+				printf("[RECIVER]Receiving file contents to be backed up..\n");
+
+				//create and open file for writing
+				if((fd = open(bf_stat.abs_dest, O_CREAT | O_WRONLY, bf_stat.mode)) == -1)
+				{
+					printf("Failed to open file: %s..\n", bf_stat.abs_dest);
+					continue;
+				}
+				printf("File opened successfully,,\n");
+
+				//Receive file contents and write to file	
+				nbytes = bf_stat.size;
+				while((nbytes > 0) && (temp = recv(sock_fd, buf, BUFSIZE, 0)))	//read file contents from the socket
+				{
+					if(temp == -1)
+					{
+						perror("recv");
+						if(errno == EINTR)
+						{
+							continue;
+						}
+						printf("Failed to read backup file contents..\n");
+						error = 1;
+						break;
+					}
+					while(temp != write(fd, buf, temp, 0))	//write file contents into the file 
+					{
+						perror("send");
+						if(errno == EINTR)
+						{
+							continue;
+						}
+						printf("Failed to send backup file contents to remote Daemon..\n");
+						free(abs_src_file);
+						free(abs_dest_file);
+						error = 1;
+						break;
+					}
+					if(error == 1)	//error while sending data
+					{
+						break;
+					}
+					nbytes -= temp;
+				}
+				if(error == 1)	//error while reading data or sending data
+				{
+					error = 0;
+					close_descriptor(fd, 0);
+					continue;
+				}
+				printf("Successfully Received backup file contents by remote Daemon..\n");
+				printf("Reading next file..\n");
+			}//end of else (handling backup of file)
+
+	}//end of while loop
+
+
+	printf("[RECIVER]Successfully Received all data..\n");
+
+	//perform cleanup
+	close_descriptor(sock_fd, 0);
+	free(backup_dirname);
+
+	return NULL;
+}
+
+
+
+//Receive Data from Utility and Process it
+void* recv_util_data(void* arg)
+{
+	int sock_fd;
+	struct arg* arg_s;
+
+	sock_fd = *((int*)arg);
+	free(arg);
+
+	arg_s = (struct  arg*)malloc(sizeof(struct arg));
+
+	if(sizeof(struct arg) != recv(sock_fd, arg_s, sizeof(struct arg), 0))
+	{
+		perror("recv");
+		printf("Data received not of expected Size..\n");
+		printf("No Operation will be performed..\n");
+		
+	}
+	else
+	{
+			//print received data
+			printf("\nStruct contents\n\n");
+			printf("options enabled: %d\n", arg_s->optns_en);
+			printf("options type: %c\n", arg_s->optns_type);
+			printf("parameter count: %d\n", arg_s->parm_c);
+			printf("parameter[0]: %s\n", arg_s->parm_val[0]);
+			printf("parameter[1]: %s\n", arg_s->parm_val[1]);
+			printf("parameter[2]: %s\n", arg_s->parm_val[2]);	
+			printf("dest. ip:     %s\n", arg_s->dest_ip);	
+			printf("hash:         %s\n", arg_s->hash);
+
+			parse_args(arg_s, sock_fd);
+	}	
+
+	free(arg_s);
+	close_descriptor(sock_fd, 0);
+
+	return NULL;
+}
+
+
+
+
+
+
+
+
+
+int main()
+{
+	int pid = 0;
+
+	printf("uid: %d euid: %d\n", getuid(), geteuid());
+	if(getuid() != 0)
+	{
+		printf("You must be a root user to run this app.\n");
+		exit(1);
+	}
+
+	if((pid = fork()) == -1)
+	{
+		perr("fork", 1);
+	}
+	if(pid > 0)
+	{
+		//parent exists (Daemon becomes orphan)
+		exit(0);
+	}	
+	else	
+	{
+		struct sigaction sigact = {0};		//to register signal handler for signal
+
+
+		//int sock_fd_lh 		= 0;			//listening socket file descriptor for Local Host
+		//int sock_fd_rh 		= 0;			//listening socket file descriptor for Remote Host
+		/////////////////////////////////////////////////////////
+		//	 ========
+		//	||	||<----- Listened by sock_fd_lh and Socket Defined by daemon_lh
+		//	||	||	|
+		//	 ======== 	|
+		//	   | |		|
+		//	   ---		|
+		//	    \		|
+		//	     \---------->
+		//	  client sends Request
+		//
+		//
+		//
+		//	 =======	 ========
+		//	||	||	||	||<----- Listened by sock_fd_rh and Socket Defined by daemon_rh
+		//	||	||	||	||	|
+		//	 =======	 ======== 	|
+		//	   | |		    | |		|
+		//	   --- 		    ---		|
+		//	    | 		
+		//	     \-------------------------->
+		//	  Daemon sends backup Request to another instance of daemon (Running on same host or remote host)
+		//
+		///////////////////////////////////////////////////////////
+		struct sockaddr_in 	daemon_lh	= {0};		//Socket Configuration To be used when Daemon is Used for Local Communication
+		struct sockaddr_in 	daemon_rh	= {0};		//Socket Configuration to be used when Daemon is Used for Remote Communication
+
+		struct sockaddr_in 	cli		= {0};		//Socket Configuration of Client that initiated the Connection
+
+		fd_set 		   	rd_set;				//File descriptor Set for select()	
+									//Initialised using FD_SET()
+		int* 			sock_fd		= NULL;
+		int 			size		= 0;		//store value-result arguement addrlen in accept()
+		pthread_t 		tid		= 0;		//thread id
+		pthread_attr_t  	tattr;				//attributes used to create a thread
+									//Initialised using pthread_attr_init() 
+
+		/************************************************/
+		/****** Configure Child Process as Daemon *******/
+		/************************************************/
+		printf("Configuring Daemon..\n");
+
+		d_pid = getpid();
+
+
+
+		//close stdin, stdout and stderr
+/*
+		if(-1 == close(0))
+		{
+			perr("close", 2);
+		}
+		if(-1 == close(1))
+		{
+			perr("close", 3);
+		}
+		if(-1 == close(2))
+		{
+			perr("close", 4);
+		}
+*/			
+		//change current working dir to root directory("/")
+		if(-1 == chdir("/"))
+		{
+			perr("chdir", 5);
+		}
+
+		//create new session and set itself as the leader of new session
+		if(-1 == setsid())
+		{
+			perr("setsid", 6);
+		}	
+
+		//set file mode creation mask	
+		umask(0);
+
+		//register SIGCHLD with sighandler
+		printf("Configuring sigaction struct for SIGCHLD..\n");
+		sigact.sa_handler = sigchld_handler;
+		sigact.sa_flags   = 0;
+		printf("configuring sigaction() for SIGCHLD\n");
+		if(-1 == sigaction(SIGCHLD, &sigact, NULL))
+		{
+			printf("Failed to register SIGCHLD with handler..\n");
+			perr("sigaction", 7);
+		}
+
+
+
+		//create directory that will keep all backups related info	
+		if(-1 == make_dir(BACKUP_DIR, DIRMODE_0700, 1))
+		{
+			printf("Failed to create: %s\n", BACKUP_DIR);
+			exit(1);
+		}
+		printf("%s created/dir already exists..\n", BACKUP_DIR);
+
+
+
+
+		////////////////////////////////////////////////////////////////////////
+		//make sure that another instance of this Daemon is not running already
+		////////////////////////////////////////////////////////////////////////
+		printf("Making sure that no other instance of this daemon is running..\n");
+		if(-1 == single_instance_check())
+		{
+			printf("Please make sure that no other instance of this daemon is running..\n");
+			exit(1);
+		}
+		printf("Only single Instance Running..\n");
+
+		printf("Daemon-v-001 configured for use..\n");
+
+
+
+
+		//create Sockets
+		printf("Creating Sockets..\n");
+		if((sock_fd_lh = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+		{
+			perror("socket");
+			return 0;
+		}
+		if((sock_fd_rh = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+		{
+			perror("socket");
+			close_descriptor(sock_fd_lh, 1);	
+		}
+		printf("Sockets Created: %d %d..\n", sock_fd_lh, sock_fd_rh);
+
+
+		//Configure Binding Details
+		//Imp: as of now, functionality of detecting current Ip address and binding to it (so that remote Hosts can connect to
+		//	this machine) hasn't been incroporated
+		//	Remember to do so in future
+		//	Also, Remember to handle the case of Multihomed network
+		printf("Configuring Binding Details..\n");
+		daemon_lh.sin_family	=	AF_INET;
+		daemon_lh.sin_port	=	htons(PORT_LH);
+		printf("Port: %d\n", daemon_lh.sin_port);
+		if(-1 == inet_pton(AF_INET, LH_IPv4, &daemon_lh.sin_addr))
+		{
+			perror("inet_pton");
+			close_descriptor(sock_fd_lh, 0);	
+			close_descriptor(sock_fd_rh, 1);	
+		}
+	
+		daemon_rh.sin_family	=	AF_INET;
+		daemon_rh.sin_port	=	htons(PORT_RH);
+		printf("Port: %d\n", daemon_rh.sin_port);
+		if(-1 == inet_pton(AF_INET, LH_IPv4, &daemon_rh.sin_addr))
+		{
+			perror("inet_pton");
+			close_descriptor(sock_fd_lh, 0);	
+			close_descriptor(sock_fd_rh, 1);	
+		}
+		printf("Binding Details Configured..\n");
+
+
+		//Perform binding
+		printf("Performing Binding..\n");
+		if(-1 == bind(sock_fd_lh, (struct sockaddr*)&daemon_lh, sizeof(daemon_lh)))
+		{
+			perror("bind");
+			close_descriptor(sock_fd_lh, 0);	
+			close_descriptor(sock_fd_rh, 1);	
+		}
+		if(-1 == bind(sock_fd_rh, (struct sockaddr*)&daemon_rh, sizeof(daemon_rh)))
+		{
+			perror("bind");
+			close_descriptor(sock_fd_lh, 0);	
+			close_descriptor(sock_fd_rh, 1);	
+		}
+		printf("Binding Performed Successfully..\n");
+
+
+		//Create Listening sockets
+		printf("Converting sockets into listening Sockets..\n");
+		if(-1 == listen(sock_fd_lh, CON_BACKLOG))
+		{
+			perror("listen");
+			close_descriptor(sock_fd_lh, 0);	
+			close_descriptor(sock_fd_rh, 1);	
+		}
+		if(-1 == listen(sock_fd_rh, CON_BACKLOG))
+		{
+			perror("listen");
+			close_descriptor(sock_fd_lh, 0);	
+			close_descriptor(sock_fd_rh, 1);	
+		}
+		printf("listening Sockets Created..\n");
+
+
+		while(1)
+		{
+			FD_ZERO(&rd_set);	//Clear Read Set
+
+			FD_SET(sock_fd_lh, &rd_set);	
+			FD_SET(sock_fd_rh, &rd_set);
+
+			printf("Calling select() on Listening sockets till member %d of read set..\n", sock_fd_rh+1);
+			if(-1 == select(sock_fd_rh + 1, &rd_set, NULL, NULL, NULL))
+			{
+				perror("select");
+				sleep(1);
+				continue;
+			}
+			printf("select() returned..\n");
+
+			//Data Received on Listening Socket
+			if(FD_ISSET(sock_fd_lh, &rd_set))
+			{
+				printf("sock_fd_lh is set..\n");
+
+				sock_fd = (int*)malloc(sizeof(int));
+
+				//accept Connection
+				size = sizeof(cli);
+				if((*sock_fd = accept(sock_fd_lh, (struct sockaddr*)&cli, &size)) == -1)
+				{
+					printf("Failed to accept Connection..\n");
+					perror("accept");
+					continue;
+				}
+				else
+				{
+					printf("Connection accepted on descriptor: %d\n", *sock_fd);
+				}
+
+				pthread_attr_init(&tattr);
+				pthread_attr_setdetachstate(&tattr, PTHREAD_CREATE_DETACHED);
+				pthread_create(&tid, &tattr, recv_util_data, sock_fd);  
+			}	
+			//Data Received on Listening Socket meant for Receiving Data to be backed up
+			if(FD_ISSET(sock_fd_rh, &rd_set))
+			{
+				printf("[Select]sock_fd_rh is set..\n");
+
+				sock_fd = (int*)malloc(sizeof(int));
+
+				//accept Connection
+				size = sizeof(cli);
+				if((*sock_fd = accept(sock_fd_rh, (struct sockaddr*)&cli, &size)) == -1)
+				{
+					printf("[Select]Failed to accept Connection..\n");
+					perror("accept");
+					continue;
+				}
+				else
+				{
+					printf("[Select]Connection accepted on descriptor: %d\n", *sock_fd);
+				}
+
+				pthread_attr_init(&tattr);
+				pthread_attr_setdetachstate(&tattr, PTHREAD_CREATE_DETACHED);
+				pthread_create(&tid, &tattr, recv_backup_data, sock_fd);  
+
+			}	
+			printf("New thread created..\n");
+
+		}//end of while
+	}//end of else
+
+}//end of main
+
+
+
